@@ -13,6 +13,9 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
+from argparse import ArgumentParser, Namespace
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
@@ -481,6 +484,105 @@ SITE_FN = {
 }
 
 
+def filter_video(video: Video, filters: SearchFilters) -> bool:
+    if video.duration_s < filters.min_duration_s:
+        return False
+    if filters.max_duration_min > 0 and video.duration_s > filters.max_duration_s:
+        return False
+    if filters.min_rating > 0 and video.rating_percent is not None and video.rating_percent < filters.min_rating:
+        return False
+    if filters.hd_only and video.is_hd is False:
+        return False
+    if filters.min_quality != "any":
+        min_quality = int(filters.min_quality)
+        if video.quality_p is not None and video.quality_p < min_quality:
+            return False
+        if video.quality_p is None and video.is_hd is False and min_quality >= 720:
+            return False
+    title_lower = video.title.lower()
+    for phrase in _split_exclude_phrases(filters.exclude_phrases):
+        if phrase in title_lower:
+            return False
+    return True
+
+
+def dedupe_videos(videos: list[Video]) -> list[Video]:
+    seen_ids: set[str] = set()
+    seen_titles: set[str] = set()
+    unique: list[Video] = []
+    for video in videos:
+        norm = _normalize_title(video.title)
+        if video.id in seen_ids:
+            continue
+        if norm and norm in seen_titles:
+            continue
+        seen_ids.add(video.id)
+        if norm:
+            seen_titles.add(norm)
+        unique.append(video)
+    return unique
+
+
+def search_videos(query: str, site: str, filters: SearchFilters, twitter_count: int = 40) -> list[Video]:
+    if site == "Twitter":
+        return dedupe_videos(search_twitter(query, twitter_count, TWITTER_COOKIES))
+
+    sites = list(SITE_FN) if site == "All Sites" else [site]
+    results: list[Video] = []
+    for name in sites:
+        found = SITE_FN[name](query, filters.min_duration_s, filters.max_duration_s, filters.pages)
+        results.extend(video for video in found if filter_video(video, filters))
+    return dedupe_videos(results)
+
+
+def video_to_dict(video: Video) -> dict[str, object]:
+    return {
+        "id": video.id,
+        "title": video.title,
+        "site": video.site,
+        "duration_seconds": video.duration_s,
+        "duration": video.duration_str,
+        "views": video.views,
+        "url": video.url,
+        "rating_percent": video.rating_percent,
+        "quality_p": video.quality_p,
+        "is_hd": video.is_hd,
+    }
+
+
+def build_filters_from_args(args: Namespace, settings: AppSettings) -> SearchFilters:
+    base = settings.search_filters
+    return SearchFilters(
+        min_duration_min=args.min_duration if args.min_duration is not None else base.min_duration_min,
+        max_duration_min=args.max_duration if args.max_duration is not None else base.max_duration_min,
+        min_quality=args.min_quality if args.min_quality is not None else base.min_quality,
+        min_rating=args.min_rating if args.min_rating is not None else base.min_rating,
+        hd_only=args.hd_only if getattr(args, "hd_only", False) else base.hd_only,
+        pages=args.pages if args.pages is not None else base.pages,
+        exclude_phrases=args.exclude if args.exclude is not None else base.exclude_phrases,
+    )
+
+
+def normalize_download_target(target: str, site: str) -> tuple[str, str]:
+    if re.match(r"^https?://", target):
+        return target, target
+    if site == "PornHub":
+        return target, f"https://www.pornhub.com/view_video.php?viewkey={target}"
+    return target, target
+
+
+def build_download_video(target: str, site: str) -> Video:
+    video_id, url = normalize_download_target(target, site)
+    return Video(
+        id=video_id,
+        title=target,
+        duration_s=0,
+        views=0,
+        url=url,
+        site=site,
+    )
+
+
 # ── Twitter/X search via headless Chrome + network capture ───────────────────
 def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
     """Search Twitter Media tab using headless Chrome, capture GraphQL responses."""
@@ -736,6 +838,41 @@ def resolve_stream_urls(video: Video) -> tuple[list[str], Optional[str]]:
     if not urls:
         return [], "yt-dlp returned no playable media URL"
     return urls, None
+
+
+def print_results_table(results: list[Video], limit: Optional[int] = None) -> None:
+    rows = results[:limit] if limit else results
+    if not rows:
+        print("No results.")
+        return
+    for idx, video in enumerate(rows, start=1):
+        duration = video.duration_str if video.duration_s else "—"
+        print(f"{idx:>3}. [{video.site}] {duration:>6}  {video.views_str:>6}  {video.title}")
+        print(f"     {video.url}")
+
+
+def download_one(video: Video, tmp_dir: Path, output_dir: Path) -> DownloadJob:
+    job = DownloadJob(video=video)
+
+    def progress_cb() -> None:
+        return
+
+    def done_cb(_: DownloadJob) -> None:
+        return
+
+    run_download(job, tmp_dir, output_dir, progress_cb, done_cb)
+    return job
+
+
+def run_batch_download(videos: list[Video], tmp_dir: Path, output_dir: Path, parallel: int) -> list[DownloadJob]:
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    jobs: list[DownloadJob] = []
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as executor:
+        futures = {executor.submit(download_one, video, tmp_dir, output_dir): video for video in videos}
+        for future in as_completed(futures):
+            jobs.append(future.result())
+    return jobs
 
 
 # ── Per-job progress row widget ───────────────────────────────────────────────
@@ -2473,6 +2610,129 @@ class FetchTUI(App):
         self.push_screen(HelpScreen())
 
 
+def run_tui() -> int:
+    FetchTUI().run()
+    return 0
+
+
+def build_parser() -> ArgumentParser:
+    parser = ArgumentParser(prog="fetcher", description="Fetcher v1.0 CLI and TUI")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("tui", help="Launch the Textual UI")
+
+    search = sub.add_parser("search", help="Search and print matching videos")
+    search.add_argument("query")
+    search.add_argument("--site", choices=SITES + ["Twitter"], default="All Sites")
+    search.add_argument("--pages", type=int)
+    search.add_argument("--min-duration", type=int, dest="min_duration")
+    search.add_argument("--max-duration", type=int, dest="max_duration")
+    search.add_argument("--min-quality", choices=["any", "360", "480", "720", "1080"])
+    search.add_argument("--min-rating", type=int)
+    search.add_argument("--hd-only", action="store_true")
+    search.add_argument("--exclude")
+    search.add_argument("--count", type=int, default=40, help="Twitter result depth")
+    search.add_argument("--limit", type=int)
+    search.add_argument("--json", action="store_true")
+
+    download = sub.add_parser("download", help="Download one or more explicit video targets")
+    download.add_argument("targets", nargs="+")
+    download.add_argument("--site", choices=["PornHub", "xHamster", "RedTube", "Eporner", "Twitter"], default="PornHub")
+    download.add_argument("--output-dir")
+    download.add_argument("--tmp-dir")
+
+    batch = sub.add_parser("batch", help="Search and download the top matching results")
+    batch.add_argument("query")
+    batch.add_argument("--site", choices=SITES + ["Twitter"], default="All Sites")
+    batch.add_argument("--pages", type=int)
+    batch.add_argument("--min-duration", type=int, dest="min_duration")
+    batch.add_argument("--max-duration", type=int, dest="max_duration")
+    batch.add_argument("--min-quality", choices=["any", "360", "480", "720", "1080"])
+    batch.add_argument("--min-rating", type=int)
+    batch.add_argument("--hd-only", action="store_true")
+    batch.add_argument("--exclude")
+    batch.add_argument("--count", type=int, default=40, help="Twitter result depth")
+    batch.add_argument("--limit", type=int, default=5)
+    batch.add_argument("--parallel", type=int, default=1)
+    batch.add_argument("--output-dir")
+    batch.add_argument("--tmp-dir")
+    batch.add_argument("--json", action="store_true", help="Print selected results as JSON before downloading")
+
+    return parser
+
+
+def cli_search(args: Namespace, settings: AppSettings) -> int:
+    filters = build_filters_from_args(args, settings)
+    results = search_videos(args.query, args.site, filters, twitter_count=args.count)
+    results.sort(key=lambda video: video.views, reverse=True)
+    if args.json:
+        print(json.dumps([video_to_dict(video) for video in (results[:args.limit] if args.limit else results)], indent=2))
+    else:
+        print_results_table(results, limit=args.limit)
+    return 0
+
+
+def cli_download(args: Namespace, settings: AppSettings) -> int:
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else settings.plex_path
+    tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else settings.tmp_path
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    exit_code = 0
+    for target in args.targets:
+        video = build_download_video(target, args.site)
+        print(f"Downloading [{video.site}] {video.url}")
+        job = download_one(video, tmp_dir, output_dir)
+        if job.status == "done":
+            print(f"Saved to {job.filepath}")
+        else:
+            print(f"Failed: {job.eta}", file=sys.stderr)
+            exit_code = 1
+    return exit_code
+
+
+def cli_batch(args: Namespace, settings: AppSettings) -> int:
+    filters = build_filters_from_args(args, settings)
+    results = search_videos(args.query, args.site, filters, twitter_count=args.count)
+    results.sort(key=lambda video: video.views, reverse=True)
+    selected = results[: max(0, args.limit)]
+    if not selected:
+        print("No results selected for download.", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps([video_to_dict(video) for video in selected], indent=2))
+
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else settings.plex_path
+    tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else settings.tmp_path
+    jobs = run_batch_download(selected, tmp_dir, output_dir, parallel=max(1, args.parallel))
+
+    failures = [job for job in jobs if job.status != "done"]
+    for job in jobs:
+        prefix = "OK" if job.status == "done" else "FAIL"
+        detail = str(job.filepath) if job.filepath else job.eta
+        print(f"{prefix}: [{job.video.site}] {job.video.title} -> {detail}")
+    return 1 if failures else 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    settings = load_settings()
+
+    if args.command in (None, "tui"):
+        return run_tui()
+    if args.command == "search":
+        return cli_search(args, settings)
+    if args.command == "download":
+        return cli_download(args, settings)
+    if args.command == "batch":
+        return cli_batch(args, settings)
+
+    parser.print_help()
+    return 1
+
+
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    FetchTUI().run()
+    raise SystemExit(main())
