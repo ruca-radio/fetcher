@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 from argparse import ArgumentParser, Namespace
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -523,6 +524,11 @@ def dedupe_videos(videos: list[Video]) -> list[Video]:
     return unique
 
 
+def _job_temp_dir(tmp_dir: Path, video: Video) -> Path:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", video.id or video.title).strip("-") or "job"
+    return tmp_dir / slug[:80]
+
+
 def search_videos(query: str, site: str, filters: SearchFilters, twitter_count: int = 40) -> list[Video]:
     if site == "Twitter":
         return dedupe_videos(search_twitter(query, twitter_count, TWITTER_COOKIES))
@@ -735,13 +741,16 @@ def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
 def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, done_cb) -> None:
     """Execute yt-dlp, parse progress into job fields, move file to plex."""
     job.status = "downloading"
+    job_tmp_dir = _job_temp_dir(tmp_dir, job.video)
+    job_tmp_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         str(YTDLP),
-        "-o", str(tmp_dir / "%(title)s.%(ext)s"),
+        "-o", str(job_tmp_dir / "%(title)s.%(ext)s"),
         "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
         "--merge-output-format", "mp4",
         "--no-playlist", "--newline", "--no-warnings",
         "--retries", "3", "--fragment-retries", "5",
+        "--print", "after_move:__FETCHER_DEST__:%(filepath)s",
     ]
     # Twitter NSFW videos require authenticated cookies
     if job.video.site == "Twitter":
@@ -757,9 +766,13 @@ def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, d
     done_re  = re.compile(r"\[download\]\s+100%\s+of")
     dest_re  = re.compile(r"\[download\] Destination: (.+)")
     merge_re = re.compile(r'\[Merger\] Merging formats into "(.+)"')
+    print_re = re.compile(r"__FETCHER_DEST__:(.+)")
+    tail = deque(maxlen=12)
 
     for line in proc.stdout or []:
         line = line.rstrip()
+        if line:
+            tail.append(line)
         if m := pct_re.search(line):
             job.progress = float(m.group(1))
             job.speed    = m.group(2)
@@ -774,13 +787,15 @@ def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, d
             dest = Path(m.group(1).strip())
         elif m := merge_re.search(line):
             dest = Path(m.group(1).strip().strip('"'))
+        elif m := print_re.search(line):
+            dest = Path(m.group(1).strip())
 
     proc.wait()
     job.proc = None
 
     if proc.returncode == 0:
         if not (dest and dest.exists()):
-            candidates = sorted(tmp_dir.glob("*.mp4"),
+            candidates = sorted(job_tmp_dir.rglob("*.mp4"),
                                 key=lambda p: p.stat().st_mtime, reverse=True)
             dest = candidates[0] if candidates else None
 
@@ -799,10 +814,20 @@ def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, d
                 job.eta    = str(e)
         else:
             job.status = "failed"
-            job.eta    = "no output file"
+            job.eta    = "no output file found"
     else:
         job.status = "failed"
-        job.eta    = f"exit {proc.returncode}"
+        failure_lines = [
+            line for line in reversed(tail)
+            if line and not line.startswith("[download]")
+        ]
+        job.eta = failure_lines[0] if failure_lines else f"exit {proc.returncode}"
+
+    try:
+        if job_tmp_dir.exists() and not any(job_tmp_dir.iterdir()):
+            job_tmp_dir.rmdir()
+    except OSError:
+        pass
 
     done_cb(job)
 
@@ -873,6 +898,14 @@ def run_batch_download(videos: list[Video], tmp_dir: Path, output_dir: Path, par
         for future in as_completed(futures):
             jobs.append(future.result())
     return jobs
+
+
+def summarize_job(job: DownloadJob) -> str:
+    if job.status == "done" and job.filepath:
+        return f"saved to {job.filepath}"
+    if job.eta:
+        return job.eta
+    return job.status
 
 
 # ── Per-job progress row widget ───────────────────────────────────────────────
@@ -2686,7 +2719,7 @@ def cli_download(args: Namespace, settings: AppSettings) -> int:
         if job.status == "done":
             print(f"Saved to {job.filepath}")
         else:
-            print(f"Failed: {job.eta}", file=sys.stderr)
+            print(f"Failed: {summarize_job(job)}", file=sys.stderr)
             exit_code = 1
     return exit_code
 
@@ -2710,8 +2743,7 @@ def cli_batch(args: Namespace, settings: AppSettings) -> int:
     failures = [job for job in jobs if job.status != "done"]
     for job in jobs:
         prefix = "OK" if job.status == "done" else "FAIL"
-        detail = str(job.filepath) if job.filepath else job.eta
-        print(f"{prefix}: [{job.video.site}] {job.video.title} -> {detail}")
+        print(f"{prefix}: [{job.video.site}] {job.video.title} -> {summarize_job(job)}")
     return 1 if failures else 0
 
 
