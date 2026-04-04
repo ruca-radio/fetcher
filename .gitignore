@@ -1,0 +1,16 @@
+.fetcher/
+.claude/
+.remember/
+.ruff_cache/
+__pycache__/
+*.pyc
+*.pid
+downloads/
+tmp/
+twitter_cookies.json
+download_output.txt
+download_log.txt
+downloaded_ids.txt
+fetchtui_settings.json
+yt-dlp
+.codex

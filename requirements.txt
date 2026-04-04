@@ -1,0 +1,5 @@
+httpx
+Pillow
+rich
+selenium
+textual
