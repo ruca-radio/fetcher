@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Fetcher v1.0 - Multi-site video downloader
 Tabs: Porn (PornHub · xHamster · RedTube · Eporner) | Twitter/X
@@ -7,22 +9,26 @@ Temporary downloads are moved into the configured output directory on completion
 """
 
 import json
+import base64
+import html
+import hashlib
+import importlib.util
 import math
 import os
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
 from argparse import ArgumentParser, Namespace
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Literal, Optional
-from urllib.parse import quote_plus
+from typing import Optional
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 from PIL import Image
@@ -40,10 +46,31 @@ from textual.widgets import (
     TabbedContent, TabPane,
 )
 
+from fetcher_core.models import (
+    AppSettings,
+    BASE_DIR,
+    DEFAULT_TMP_DIR,
+    DownloadJob,
+    FileEntry,
+    FileSortKey,
+    QualityFilter,
+    SearchFilters,
+    STATE_DIR,
+    SortKey,
+    Video,
+)
+from fetcher_core.jobs import DownloadManager, JobHistoryStore
+from fetcher_core.settings import (
+    DEFAULT_LOCAL_COMPLETED_DIR,
+    SettingsStore,
+    is_sftp_storage,
+    normalize_min_quality,
+    parse_sftp_storage,
+    prepare_runtime_settings,
+    resolve_runtime_dirs,
+)
+
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
-STATE_DIR = BASE_DIR / ".fetcher"
-DEFAULT_TMP_DIR = BASE_DIR / "tmp"
 DEFAULT_OUTPUT_DIR = Path.home() / "Downloads" / "fetcher"
 DOWNLOADED_IDS = STATE_DIR / "downloaded_ids.txt"
 TWITTER_COOKIES = STATE_DIR / "twitter_cookies.json"
@@ -51,10 +78,7 @@ SETTINGS_PATH  = STATE_DIR / "settings.json"
 YTDLP = BASE_DIR / "yt-dlp"
 if not YTDLP.exists():
     detected_ytdlp = shutil.which("yt-dlp")
-    YTDLP = Path(detected_ytdlp) if detected_ytdlp else Path("/usr/bin/yt-dlp")
-
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-DEFAULT_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    YTDLP = Path(detected_ytdlp) if detected_ytdlp else None
 
 HEADERS = {
     "User-Agent": (
@@ -67,6 +91,39 @@ HEADERS = {
 SITES = ["All Sites", "PornHub", "xHamster", "RedTube", "Eporner"]
 MPV = shutil.which("mpv")
 DEFAULT_EXCLUDE_PHRASES = ""
+DEFAULT_SEARXNG_URL = "https://search.studioddx.com"
+DEFAULT_MIN_QUALITY = "720"
+MIN_DOWNLOAD_HEIGHT = 720
+YTDLP_FORMAT = f"bestvideo[height>={MIN_DOWNLOAD_HEIGHT}]+bestaudio/best[height>={MIN_DOWNLOAD_HEIGHT}]"
+YTDLP_FLEX_FORMAT = "bestvideo+bestaudio/best"
+MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+PARTIAL_EXTENSIONS = {".part", ".ytdl"}
+CENSORED_MEDIA_MARKERS = ("/sfw/", "/censored/", "/blurred/")
+FFMPEG = shutil.which("ffmpeg")
+FFPROBE = shutil.which("ffprobe")
+LAST_PROVIDER_ERRORS: dict[str, str] = {}
+
+
+def _record_provider_error(site: str, message: str) -> None:
+    LAST_PROVIDER_ERRORS[site] = message
+
+
+def _clear_provider_error(site: str) -> None:
+    LAST_PROVIDER_ERRORS.pop(site, None)
+
+
+def resolve_ytdlp_command() -> tuple[Optional[list[str]], Optional[str]]:
+    """Resolve yt-dlp from a bundled binary, PATH, or the active Python env."""
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"], None
+    if YTDLP and YTDLP.exists():
+        return [str(YTDLP)], None
+    if shutil.which("yt-dlp"):
+        return ["yt-dlp"], None
+    return None, (
+        "yt-dlp is not installed. Install it and make sure `yt-dlp` is on your PATH, "
+        f"or place a `yt-dlp` binary in {BASE_DIR}."
+    )
 
 
 # ── Already-downloaded detection ──────────────────────────────────────────────
@@ -80,50 +137,13 @@ def _split_exclude_phrases(raw: str) -> list[str]:
 
 
 def load_settings() -> AppSettings:
-    if SETTINGS_PATH.exists():
-        try:
-            data = json.loads(SETTINGS_PATH.read_text())
-            sf = data.get("search_filters", {}) or {}
-            return AppSettings(
-                theme=str(data.get("theme", "textual-dark")),
-                thumbnails_enabled=bool(data.get("thumbnails_enabled", True)),
-                video_previews_enabled=bool(data.get("video_previews_enabled", True)),
-                plex_dir=str(data.get("plex_dir", DEFAULT_OUTPUT_DIR)),
-                tmp_dir=str(data.get("tmp_dir", DEFAULT_TMP_DIR)),
-                parallel_downloads=max(1, int(data.get("parallel_downloads", 3))),
-                search_filters=SearchFilters(
-                    min_duration_min=max(0, int(sf.get("min_duration_min", 0) or 0)),
-                    max_duration_min=max(0, int(sf.get("max_duration_min", 0) or 0)),
-                    min_quality=str(sf.get("min_quality", "any")),  # type: ignore[arg-type]
-                    min_rating=max(0, int(sf.get("min_rating", 0) or 0)),
-                    hd_only=bool(sf.get("hd_only", False)),
-                    pages=max(1, int(sf.get("pages", 2) or 2)),
-                    exclude_phrases=str(sf.get("exclude_phrases", DEFAULT_EXCLUDE_PHRASES)),
-                ),
-            )
-        except Exception:
-            pass
-    return AppSettings()
+    return SettingsStore(SETTINGS_PATH, defaults=AppSettings()).load().settings
 
 
 def save_settings(settings: AppSettings) -> None:
-    SETTINGS_PATH.write_text(json.dumps({
-        "theme": settings.theme,
-        "thumbnails_enabled": settings.thumbnails_enabled,
-        "video_previews_enabled": settings.video_previews_enabled,
-        "plex_dir": settings.plex_dir,
-        "tmp_dir": settings.tmp_dir,
-        "parallel_downloads": settings.parallel_downloads,
-        "search_filters": {
-            "min_duration_min": settings.search_filters.min_duration_min,
-            "max_duration_min": settings.search_filters.max_duration_min,
-            "min_quality": settings.search_filters.min_quality,
-            "min_rating": settings.search_filters.min_rating,
-            "hd_only": settings.search_filters.hd_only,
-            "pages": settings.search_filters.pages,
-            "exclude_phrases": settings.search_filters.exclude_phrases,
-        },
-    }, indent=2))
+    store = SettingsStore(SETTINGS_PATH, defaults=AppSettings())
+    store.load()
+    store.save(settings)
 
 
 def load_downloaded(plex_dir: Path) -> tuple[set[str], set[str]]:
@@ -137,7 +157,7 @@ def load_downloaded(plex_dir: Path) -> tuple[set[str], set[str]]:
                 ids.add(line)
     if plex_dir.exists():
         for f in plex_dir.iterdir():
-            if f.suffix == ".mp4":
+            if f.suffix.lower() in MEDIA_EXTENSIONS:
                 norm = _normalize_title(f.stem)
                 if norm:
                     titles.add(norm)
@@ -153,20 +173,20 @@ def _fmt_size(nbytes: int) -> str:
 
 
 def cleanup_tmp(tmp_dir: Path, plex_dir: Path) -> tuple[int, int]:
-    """Move completed mp4s to plex, delete stale partials. Returns (moved, deleted)."""
+    """Move completed media to plex, delete stale partials. Returns (moved, deleted)."""
     moved = deleted = 0
     if not tmp_dir.exists():
         return moved, deleted
     tmp_dir.mkdir(parents=True, exist_ok=True)
     plex_dir.mkdir(parents=True, exist_ok=True)
     for f in tmp_dir.iterdir():
-        if f.suffix == ".mp4" and ".part" not in f.name:
+        if f.suffix.lower() in MEDIA_EXTENSIONS and ".part" not in f.name:
             try:
                 shutil.move(str(f), str(plex_dir / f.name))
                 moved += 1
             except Exception:
                 pass
-        elif f.suffix in (".part", ".ytdl") or ".part-Frag" in f.name:
+        elif f.suffix.lower() in PARTIAL_EXTENSIONS or ".part-Frag" in f.name:
             try:
                 f.unlink()
                 deleted += 1
@@ -193,107 +213,13 @@ def _render_ascii_thumbnail(image_bytes: bytes, width: int = 34) -> str:
     return "\n".join(lines)
 
 
-# ── Data model ────────────────────────────────────────────────────────────────
-@dataclass
-class Video:
-    id: str
-    title: str
-    duration_s: int
-    views: int
-    url: str
-    site: str
-    thumbnail_url: Optional[str] = None
-    rating_percent: Optional[int] = None
-    quality_p: Optional[int] = None
-    is_hd: Optional[bool] = None
-    selected: bool = False
-
-    @property
-    def duration_str(self) -> str:
-        m, s = divmod(self.duration_s, 60)
-        return f"{m}:{s:02d}"
-
-    @property
-    def views_str(self) -> str:
-        v = self.views
-        if v >= 1_000_000:
-            return f"{v/1_000_000:.1f}M"
-        if v >= 1_000:
-            return f"{v/1_000:.0f}K"
-        return str(v)
-
-
-@dataclass
-class DownloadJob:
-    video: Video
-    status: str = "queued"   # queued | downloading | paused | done | failed
-    progress: float = 0.0
-    speed: str = ""
-    eta: str = ""
-    filepath: Optional[Path] = None
-    file_size: int = 0
-    proc: Optional[subprocess.Popen] = None
-    worker_started: bool = False
-
-
-SortKey = Literal["title", "duration", "site", "views"]
-FileSortKey = Literal["name", "size", "modified", "path"]
-QualityFilter = Literal["any", "360", "480", "720", "1080"]
-
-
-@dataclass
-class SearchFilters:
-    min_duration_min: int = 0
-    max_duration_min: int = 0
-    min_quality: QualityFilter = "any"
-    min_rating: int = 0
-    hd_only: bool = False
-    pages: int = 2
-    exclude_phrases: str = DEFAULT_EXCLUDE_PHRASES
-
-    @property
-    def min_duration_s(self) -> int:
-        return max(0, self.min_duration_min) * 60
-
-    @property
-    def max_duration_s(self) -> int:
-        if self.max_duration_min <= 0:
-            return 24 * 60 * 60
-        return self.max_duration_min * 60
-
-
-@dataclass
-class AppSettings:
-    theme: str = "textual-dark"
-    thumbnails_enabled: bool = True
-    video_previews_enabled: bool = True
-    plex_dir: str = str(DEFAULT_OUTPUT_DIR)
-    tmp_dir: str = str(DEFAULT_TMP_DIR)
-    parallel_downloads: int = 3
-    search_filters: SearchFilters = field(default_factory=SearchFilters)
-
-    @property
-    def plex_path(self) -> Path:
-        return Path(self.plex_dir).expanduser()
-
-    @property
-    def tmp_path(self) -> Path:
-        return Path(self.tmp_dir).expanduser()
-
-
-@dataclass
-class FileEntry:
-    path: Path
-    size: int
-    modified_ts: float
-
-    @property
-    def name(self) -> str:
-        return self.path.name
-
-    @property
-    def modified_str(self) -> str:
-        return datetime.fromtimestamp(self.modified_ts).strftime("%Y-%m-%d %H:%M")
+def _file_preview_text(entry: FileEntry) -> Text:
+    text = Text()
+    text.append(entry.name, style="bold")
+    text.append(f"\nSize: {_fmt_size(entry.size)}\n")
+    text.append(f"Modified: {entry.modified_str}\n")
+    text.append(str(entry.path), style="dim")
+    return text
 
 
 # ── Porn search functions ────────────────────────────────────────────────────
@@ -335,13 +261,195 @@ def _parse_quality(value: object) -> Optional[int]:
     return None
 
 
+def _clean_thumbnail_url(url: object) -> Optional[str]:
+    if not url:
+        return None
+    if isinstance(url, dict):
+        url = url.get("src") or url.get("url") or url.get("thumb")
+    elif isinstance(url, list):
+        for item in url:
+            cleaned = _clean_thumbnail_url(item)
+            if cleaned:
+                return cleaned
+        return None
+    text = str(url).replace("\\/", "/")
+    # Some xHamster search rows expose explicitly blurred "sfw" thumbnails.
+    # Those thumbnails are also a good signal that the row itself should not be
+    # auto-selected for downloads in this app.
+    if "/sfw/" in text:
+        return None
+    return html.unescape(text)
+
+
+def _first_clean_thumbnail(*urls: object) -> Optional[str]:
+    for url in urls:
+        cleaned = _clean_thumbnail_url(url)
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _parse_int(value: object) -> int:
+    try:
+        return int(str(value).replace(",", "").strip() or "0")
+    except Exception:
+        return 0
+
+
+def _least_factor(n: int) -> int:
+    if n == 0:
+        return 0
+    if n * n < 2:
+        return 1
+    if n % 2 == 0:
+        return 2
+    if n % 3 == 0:
+        return 3
+    if n % 5 == 0:
+        return 5
+    limit = math.isqrt(n)
+    for i in range(7, limit + 1, 30):
+        for offset in (0, 4, 6, 10, 12, 16, 22, 24):
+            candidate = i + offset
+            if candidate <= limit and n % candidate == 0:
+                return candidate
+    return n
+
+
+def _solve_pornhub_key_challenge(text: str) -> Optional[str]:
+    if "document.cookie=\"KEY=\"" not in text or "function leastFactor" not in text:
+        return None
+    cleaned = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    p_match = re.search(r"var\s+p\s*=\s*(\d+)", cleaned)
+    s_match = re.search(r"var\s+s\s*=\s*(\d+)", cleaned)
+    tail_match = re.search(r'KEY="\+n\+"\*"\+p/n\+":"\+s\+":(\d+):(\d+);path=/', cleaned)
+    if not p_match or not s_match or not tail_match:
+        return None
+
+    p = int(p_match.group(1))
+    s = int(s_match.group(1))
+    conditional_re = re.compile(
+        r"if\s*\(\(s\s*>>\s*(\d+)\)\s*&\s*1\)\s*"
+        r"p\s*([+-])=\s*(\d+)\s*\*\s*(\d+)\s*;\s*"
+        r"else\s*p\s*([+-])=\s*(\d+)\s*\*\s*(\d+)\s*;",
+        re.DOTALL,
+    )
+    for match in conditional_re.finditer(cleaned):
+        bit = int(match.group(1))
+        if (s >> bit) & 1:
+            op, left, right = match.group(2), match.group(3), match.group(4)
+        else:
+            op, left, right = match.group(5), match.group(6), match.group(7)
+        value = int(left) * int(right)
+        p = p + value if op == "+" else p - value
+
+    remaining = conditional_re.sub("", cleaned)
+    for match in re.finditer(r"p\s*([+-])=\s*(\d+)(?:\s*\*\s*(\d+))?\s*;", remaining):
+        value = int(match.group(2)) * (int(match.group(3)) if match.group(3) else 1)
+        p = p + value if match.group(1) == "+" else p - value
+
+    factor = _least_factor(p)
+    return f"{factor}*{p // factor}:{s}:{tail_match.group(1)}:{tail_match.group(2)}"
+
+
+def _pornhub_get(client: httpx.Client, url: str) -> httpx.Response:
+    response = client.get(url, follow_redirects=True)
+    key = _solve_pornhub_key_challenge(response.text)
+    if key:
+        host = urlparse(str(response.url)).hostname or "www.pornhub.com"
+        client.cookies.set("KEY", key, domain=host, path="/")
+        client.cookies.set("KEY", key, domain="pornhub.com", path="/")
+        response = client.get(url, follow_redirects=True)
+    return response
+
+
+def _search_pornhub_html(client: httpx.Client, query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
+    out: list[Video] = []
+    seen: set[str] = set()
+    card_re = re.compile(
+        r'<li[^>]+(?:data-video-vkey|data-video-id)="(?P<id>[^"]+)"[^>]*>(?P<body>.*?)</li>',
+        re.DOTALL | re.IGNORECASE,
+    )
+    link_re = re.compile(r'href="(?P<href>/view_video\.php\?viewkey=(?P<id>[a-zA-Z0-9]+)[^"]*)"', re.IGNORECASE)
+    title_re = re.compile(r'(?:title|data-title)="(?P<title>[^"]+)"', re.IGNORECASE)
+    duration_re = re.compile(r'class="[^"]*duration[^"]*"[^>]*>\s*(?P<dur>[^<]+)', re.IGNORECASE)
+    views_re = re.compile(r'(?P<views>[\d,.]+)\s+views', re.IGNORECASE)
+    thumb_re = re.compile(r'(?:data-mediumthumb|data-thumb_url|src)="(?P<thumb>https?://[^"]+)"', re.IGNORECASE)
+
+    for page in range(1, pages + 1):
+        url = f"https://www.pornhub.com/video/search?search={quote_plus(query)}&page={page}"
+        response = _pornhub_get(client, url)
+        final_path = urlparse(str(response.url)).path.rstrip("/")
+        if (
+            response.status_code >= 400
+            or final_path in {"", "/"}
+            or _solve_pornhub_key_challenge(response.text)
+        ):
+            _record_provider_error(
+                "PornHub",
+                "search page redirected away from results; this is usually regional access, age verification, or anti-bot gating",
+            )
+            continue
+        text = response.text
+        fragments: list[tuple[str, str]] = [
+            (match.group("id"), match.group("body"))
+            for match in card_re.finditer(text)
+        ]
+        if not fragments:
+            # Fallback for looser markup: group around every view_video link.
+            for match in link_re.finditer(text):
+                start = max(0, match.start() - 1200)
+                end = min(len(text), match.end() + 1200)
+                body = text[start:end]
+                fragments.append((match.group("id"), body))
+        for fallback_id, body in fragments:
+            link = link_re.search(body)
+            vid = link.group("id") if link else fallback_id
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
+            title_match = title_re.search(body)
+            title = html.unescape(title_match.group("title")) if title_match else vid
+            dur_match = duration_re.search(body)
+            dur = _parse_dur(dur_match.group("dur").strip()) if dur_match else 0
+            if dur and not (min_s <= dur <= max_s):
+                continue
+            views_match = views_re.search(body)
+            thumb_match = thumb_re.search(body)
+            out.append(Video(
+                id=vid,
+                title=title,
+                duration_s=dur,
+                views=_parse_int(views_match.group("views")) if views_match else 0,
+                url=f"https://www.pornhub.com/view_video.php?viewkey={vid}",
+                site="PornHub",
+                thumbnail_url=_clean_thumbnail_url(thumb_match.group("thumb")) if thumb_match else None,
+            ))
+    if out:
+        _clear_provider_error("PornHub")
+    return out
+
+
 def search_pornhub(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
     out, seen = [], set()
     with httpx.Client(timeout=20, verify=False, headers=HEADERS) as c:
+        html_results = _search_pornhub_html(c, query, min_s, max_s, pages)
+        if html_results:
+            return html_results
         for page in range(1, pages + 1):
             url = f"https://www.pornhub.com/webmasters/search?search={quote_plus(query)}&page={page}"
             try:
-                for v in c.get(url).json().get("videos", []):
+                response = _pornhub_get(c, url)
+                content_type = response.headers.get("content-type", "").lower()
+                if urlparse(str(response.url)).path != "/webmasters/search" or "json" not in content_type:
+                    _record_provider_error("PornHub", "legacy webmaster API unavailable; trying HTML search fallback")
+                    return _search_pornhub_html(c, query, min_s, max_s, pages)
+                try:
+                    payload = response.json()
+                except ValueError:
+                    _record_provider_error("PornHub", "legacy webmaster API returned non-JSON; trying HTML search fallback")
+                    return _search_pornhub_html(c, query, min_s, max_s, pages)
+                for v in payload.get("videos", []):
                     vid = v.get("video_id", "")
                     if not vid or vid in seen:
                         continue
@@ -353,12 +461,13 @@ def search_pornhub(query: str, min_s: int, max_s: int, pages: int) -> list[Video
                             duration_s=dur, views=int(v.get("views", 0) or 0),
                             url=f"https://www.pornhub.com/view_video.php?viewkey={vid}",
                             site="PornHub",
-                            thumbnail_url=v.get("default_thumb") or v.get("thumb"),
+                            thumbnail_url=_first_clean_thumbnail(v.get("default_thumb"), v.get("thumb")),
                             rating_percent=_parse_percent(v.get("rating")),
                             quality_p=_parse_quality(v.get("quality")) or (720 if hd else 480),
                             is_hd=hd))
-            except Exception:
-                pass
+                _clear_provider_error("PornHub")
+            except Exception as exc:
+                _record_provider_error("PornHub", str(exc))
     return out
 
 
@@ -383,6 +492,7 @@ def _xh_parse(html: str) -> list[dict]:
 
 def search_xhamster(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
     out, seen = [], set()
+    skipped_blurred = 0
     slug = re.sub(r"\s+", "-", query.strip())
     with httpx.Client(timeout=20, verify=False, headers=HEADERS, follow_redirects=True) as c:
         for page in range(1, pages + 1):
@@ -392,6 +502,17 @@ def search_xhamster(query: str, min_s: int, max_s: int, pages: int) -> list[Vide
                     vid = str(v.get("id", ""))
                     if not vid or vid in seen:
                         continue
+                    thumbnail = _first_clean_thumbnail(
+                        v.get("previewThumbURL"),
+                        v.get("imageURL"),
+                        v.get("thumbURL169"),
+                        v.get("thumbURL"),
+                    )
+                    if v.get("isBlurredText") and thumbnail is None:
+                        skipped_blurred += 1
+                    page_url = str(v.get("pageURL", "")).replace("\\/", "/")
+                    if not page_url:
+                        continue
                     seen.add(vid)
                     dur = int(v.get("duration", 0))
                     if min_s <= dur <= max_s:
@@ -399,18 +520,18 @@ def search_xhamster(query: str, min_s: int, max_s: int, pages: int) -> list[Vide
                         hd_flag = v.get("isHD")
                         out.append(Video(id=vid, title=v.get("title", ""),
                             duration_s=dur, views=int(v.get("viewCount", 0) or 0),
-                            url=v.get("pageURL", "").replace("\\/", "/"),
+                            url=page_url,
                             site="xHamster",
-                            thumbnail_url=(
-                                v.get("thumbURL")
-                                or v.get("thumbURL169")
-                                or v.get("imageURL")
-                            ),
+                            thumbnail_url=thumbnail,
                             rating_percent=_parse_percent(v.get("rating")),
                             quality_p=quality,
                             is_hd=bool(hd_flag) if hd_flag is not None else (quality >= 720 if quality is not None else None)))
-            except Exception:
-                pass
+                if out:
+                    _clear_provider_error("xHamster")
+            except Exception as exc:
+                _record_provider_error("xHamster", str(exc))
+    if not out and skipped_blurred:
+        _record_provider_error("xHamster", f"skipped {skipped_blurred} blurred/search-only rows that are not downloadable")
     return out
 
 
@@ -420,7 +541,7 @@ def search_redtube(query: str, min_s: int, max_s: int, pages: int) -> list[Video
         for page in range(1, pages + 1):
             url = (f"https://api.redtube.com/?data=redtube.Videos.searchVideos"
                    f"&search={quote_plus(query)}&output=json&page={page}&limit=20"
-                   f"&min_duration={min_s}&max_duration={max_s}")
+                   f"&thumbsize=big")
             try:
                 for entry in c.get(url).json().get("videos", []):
                     v = entry.get("video", {})
@@ -435,12 +556,13 @@ def search_redtube(query: str, min_s: int, max_s: int, pages: int) -> list[Video
                             duration_s=dur, views=int(v.get("views", 0) or 0),
                             url=v.get("url", f"https://www.redtube.com/{vid}"),
                             site="RedTube",
-                            thumbnail_url=v.get("default_thumb") or v.get("thumb"),
+                            thumbnail_url=_first_clean_thumbnail(v.get("default_thumb"), v.get("thumb")),
                             rating_percent=_parse_percent(v.get("rating")),
                             quality_p=_parse_quality(v.get("quality")) or (720 if hd else 480),
                             is_hd=hd))
-            except Exception:
-                pass
+                _clear_provider_error("RedTube")
+            except Exception as exc:
+                _record_provider_error("RedTube", str(exc))
     return out
 
 
@@ -468,12 +590,116 @@ def search_eporner(query: str, min_s: int, max_s: int, pages: int) -> list[Video
                         out.append(Video(id=vid, title=v.get("title", ""),
                             duration_s=dur, views=int(v.get("views", 0) or 0),
                             url=raw_url, site="Eporner",
-                            thumbnail_url=v.get("default_thumb") or v.get("thumb"),
+                            thumbnail_url=_first_clean_thumbnail(v.get("default_thumb"), v.get("thumb")),
                             rating_percent=_parse_percent(v.get("rate") or v.get("rating")),
                             quality_p=quality,
                             is_hd=(quality >= 720) if quality is not None else None))
-            except Exception:
-                pass
+                _clear_provider_error("Eporner")
+            except Exception as exc:
+                _record_provider_error("Eporner", str(exc))
+    return out
+
+
+def _site_from_url(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    if "pornhub" in host:
+        return "PornHub"
+    if "xhamster" in host:
+        return "xHamster"
+    if "redtube" in host:
+        return "RedTube"
+    if "eporner" in host:
+        return "Eporner"
+    return host.removeprefix("www.") or "SearXNG"
+
+
+def _unwrap_nudevista_url(url: str) -> str:
+    parsed = urlparse(url)
+    if "nudevista.com" not in parsed.netloc.lower():
+        return url
+    parts = parsed.path.split("/")
+    if len(parts) < 3 or parts[1] != "video":
+        return url
+    encoded = parts[2].split("-", 1)[0]
+    try:
+        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8", "replace")
+    except Exception:
+        return url
+    match = re.search(r"https?://[^\s]+", decoded)
+    if not match:
+        return url
+    target = match.group(0).replace("#", "-").rstrip("/")
+    return target or url
+
+
+def _resolved_searxng_url(raw_url: str, base_url: str) -> Optional[str]:
+    parsed = urlparse(raw_url)
+    base_host = urlparse(base_url).netloc.lower()
+    if parsed.netloc.lower() == base_host:
+        return None
+    if parsed.path.startswith("/search"):
+        return None
+    return _unwrap_nudevista_url(raw_url)
+
+
+def search_searxng(query: str, settings: AppSettings, pages: int, limit: int = 0) -> list[Video]:
+    base_url = settings.searxng_url.strip().rstrip("/")
+    if not base_url:
+        return []
+    out: list[Video] = []
+    seen: set[str] = set()
+    params = {
+        "q": query,
+        "format": "json",
+        "pageno": "1",
+    }
+    if settings.searxng_categories.strip():
+        params["categories"] = settings.searxng_categories.strip()
+    with httpx.Client(timeout=25, verify=False, headers=HEADERS, follow_redirects=True) as client:
+        for page in range(1, max(1, pages) + 1):
+            params["pageno"] = str(page)
+            try:
+                response = client.get(f"{base_url}/search", params=params)
+                response.raise_for_status()
+                data = response.json()
+            except Exception as exc:
+                _record_provider_error("SearXNG", str(exc))
+                break
+            for item in data.get("results", []):
+                if not isinstance(item, dict):
+                    continue
+                raw_url = str(item.get("url") or "").strip()
+                if not raw_url.startswith(("http://", "https://")) or raw_url in seen:
+                    continue
+                source_url = _resolved_searxng_url(raw_url, base_url)
+                if not source_url or source_url in seen:
+                    continue
+                seen.add(source_url)
+                title = html.unescape(str(item.get("title") or source_url))
+                thumb = _first_clean_thumbnail(
+                    item.get("thumbnail"),
+                    item.get("img_src"),
+                    item.get("content_img_src"),
+                )
+                author = str(item.get("author") or "").strip()
+                site = _site_from_url(source_url)
+                if site == "SearXNG" and author:
+                    site = author[:1].upper() + author[1:]
+                digest = hashlib.sha1(source_url.encode("utf-8")).hexdigest()[:16]
+                out.append(Video(
+                    id=f"searxng-{digest}",
+                    title=title,
+                    duration_s=_parse_dur(str(item.get("length") or "")),
+                    views=0,
+                    url=source_url,
+                    site=site or "SearXNG",
+                    thumbnail_url=thumb,
+                ))
+                if limit > 0 and len(out) >= limit:
+                    _clear_provider_error("SearXNG")
+                    return out
+    if out:
+        _clear_provider_error("SearXNG")
     return out
 
 
@@ -553,6 +779,7 @@ def video_to_dict(video: Video) -> dict[str, object]:
         "rating_percent": video.rating_percent,
         "quality_p": video.quality_p,
         "is_hd": video.is_hd,
+        "thumbnail_url": video.thumbnail_url,
     }
 
 
@@ -561,7 +788,7 @@ def build_filters_from_args(args: Namespace, settings: AppSettings) -> SearchFil
     return SearchFilters(
         min_duration_min=args.min_duration if args.min_duration is not None else base.min_duration_min,
         max_duration_min=args.max_duration if args.max_duration is not None else base.max_duration_min,
-        min_quality=args.min_quality if args.min_quality is not None else base.min_quality,
+        min_quality=normalize_min_quality(args.min_quality if args.min_quality is not None else base.min_quality),
         min_rating=args.min_rating if args.min_rating is not None else base.min_rating,
         hd_only=args.hd_only if getattr(args, "hd_only", False) else base.hd_only,
         pages=args.pages if args.pages is not None else base.pages,
@@ -738,36 +965,122 @@ def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
 
 
 # ── Download worker (runs in thread) ─────────────────────────────────────────
-def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, done_cb) -> None:
-    """Execute yt-dlp, parse progress into job fields, move file to plex."""
-    job.status = "downloading"
-    job_tmp_dir = _job_temp_dir(tmp_dir, job.video)
-    job_tmp_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        str(YTDLP),
-        "-o", str(job_tmp_dir / "%(title)s.%(ext)s"),
-        "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-        "--merge-output-format", "mp4",
-        "--no-playlist", "--newline", "--no-warnings",
-        "--retries", "3", "--fragment-retries", "5",
-        "--print", "after_move:__FETCHER_DEST__:%(filepath)s",
+def _site_ytdlp_args(video: Video) -> list[str]:
+    if video.site == "Twitter":
+        return ["--cookies-from-browser", "chrome"]
+    return []
+
+
+def _provider_download_url(video: Video) -> str:
+    if video.site == "Eporner" or "eporner.com" in video.url:
+        vid = video.id
+        if not vid or vid.startswith("http"):
+            match = re.search(r"(?:video-|embed/|hd-porn/)([a-zA-Z0-9]+)", video.url)
+            vid = match.group(1) if match else ""
+        if vid:
+            return f"https://www.eporner.com/embed/{vid}/"
+    return video.url
+
+
+def _is_known_censored_media_url(url: str) -> bool:
+    lowered = url.lower()
+    return any(marker in lowered for marker in CENSORED_MEDIA_MARKERS)
+
+
+def _safe_media_stem(video: Video) -> str:
+    raw = video.title or video.id or "video"
+    stem = re.sub(r"[^a-zA-Z0-9._ -]+", "", raw).strip(" ._-")
+    stem = re.sub(r"\s+", " ", stem)
+    if video.id and video.id not in stem:
+        stem = f"{stem} [{video.id}]" if stem else video.id
+    return stem[:180] or "video"
+
+
+def _latest_media_file(job_tmp_dir: Path) -> Optional[Path]:
+    candidates = [
+        path for path in job_tmp_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS and ".part" not in path.name
     ]
-    # Twitter NSFW videos require authenticated cookies
-    if job.video.site == "Twitter":
-        cmd.extend(["--cookies-from-browser", "chrome"])
-    cmd.append(job.video.url)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, start_new_session=True)
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
+def _job_temp_bytes(job_tmp_dir: Path) -> int:
+    total = 0
+    if not job_tmp_dir.exists():
+        return 0
+    for path in job_tmp_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() in MEDIA_EXTENSIONS | PARTIAL_EXTENSIONS or ".part" in path.name:
+            try:
+                total += path.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _probe_video_height(path: Path) -> Optional[int]:
+    if not FFPROBE:
+        return None
+    proc = subprocess.run(
+        [
+            FFPROBE,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=height",
+            "-of", "json",
+            str(path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        streams = json.loads(proc.stdout or "{}").get("streams", [])
+        height = streams[0].get("height") if streams else None
+        return int(height) if height else None
+    except Exception:
+        return None
+
+
+def _run_download_process(
+    job: DownloadJob,
+    cmd: list[str],
+    progress_cb,
+    *,
+    expected_dest: Optional[Path] = None,
+) -> tuple[int, Optional[Path], deque[str]]:
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return 1, None, deque([str(exc)], maxlen=12)
+
     job.proc = proc
     progress_cb()
 
-    dest: Optional[Path] = None
-    pct_re   = re.compile(r"\[download\]\s+([\d.]+)%.*?at\s+([\d.]+\s*\S+).*?ETA\s+(\S+)")
-    done_re  = re.compile(r"\[download\]\s+100%\s+of")
-    dest_re  = re.compile(r"\[download\] Destination: (.+)")
+    dest = expected_dest
+    progress_dir = expected_dest.parent if expected_dest else None
+    if progress_dir is None and "-o" in cmd:
+        progress_dir = Path(cmd[cmd.index("-o") + 1]).parent
+    pct_re = re.compile(r"\[download\].*?([\d.]+)%")
+    speed_re = re.compile(r"\bat\s+([\d.]+\s*[^\s]+)")
+    eta_re = re.compile(r"\bETA\s+(\S+)")
+    done_re = re.compile(r"\[download\]\s+100%\s+of")
+    dest_re = re.compile(r"\[download\] Destination: (.+)")
     merge_re = re.compile(r'\[Merger\] Merging formats into "(.+)"')
     print_re = re.compile(r"__FETCHER_DEST__:(.+)")
-    tail = deque(maxlen=12)
+    ffmpeg_time_re = re.compile(r"time=(\S+)")
+    tail: deque[str] = deque(maxlen=12)
 
     for line in proc.stdout or []:
         line = line.rstrip()
@@ -775,13 +1088,19 @@ def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, d
             tail.append(line)
         if m := pct_re.search(line):
             job.progress = float(m.group(1))
-            job.speed    = m.group(2)
-            job.eta      = m.group(3)
+            if speed := speed_re.search(line):
+                job.speed = speed.group(1)
+            if eta := eta_re.search(line):
+                job.eta = eta.group(1)
+            if progress_dir:
+                job.downloaded_bytes = _job_temp_bytes(progress_dir)
             progress_cb()
         elif done_re.search(line):
             job.progress = 100.0
-            job.speed    = ""
-            job.eta      = ""
+            job.speed = ""
+            job.eta = ""
+            if progress_dir:
+                job.downloaded_bytes = _job_temp_bytes(progress_dir)
             progress_cb()
         elif m := dest_re.search(line):
             dest = Path(m.group(1).strip())
@@ -789,39 +1108,305 @@ def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, d
             dest = Path(m.group(1).strip().strip('"'))
         elif m := print_re.search(line):
             dest = Path(m.group(1).strip())
+        elif m := ffmpeg_time_re.search(line):
+            job.eta = f"ffmpeg {m.group(1)}"
+            if progress_dir:
+                job.downloaded_bytes = _job_temp_bytes(progress_dir)
+            progress_cb()
 
     proc.wait()
     job.proc = None
+    return proc.returncode, dest, tail
 
-    if proc.returncode == 0:
-        if not (dest and dest.exists()):
-            candidates = sorted(job_tmp_dir.rglob("*.mp4"),
-                                key=lambda p: p.stat().st_mtime, reverse=True)
-            dest = candidates[0] if candidates else None
 
-        if dest and dest.exists():
-            target = plex_dir / dest.name
+def _failure_from_tail(tail: deque[str], returncode: int) -> str:
+    failure_lines = [
+        line for line in reversed(tail)
+        if line and not line.startswith("[download]")
+    ]
+    return failure_lines[0] if failure_lines else f"exit {returncode}"
+
+
+def _best_download_failure(failures: list[str], fallback: str) -> str:
+    if not failures:
+        return fallback
+    generic_markers = (
+        "unsupported url",
+        "forcing generic information extractor",
+    )
+    if fallback and not any(marker in fallback.lower() for marker in generic_markers):
+        return fallback
+    for failure in failures:
+        if failure and not any(marker in failure.lower() for marker in generic_markers):
+            return failure
+    return fallback or failures[-1]
+
+
+def _finalize_downloaded_file(
+    job: DownloadJob,
+    dest: Optional[Path],
+    job_tmp_dir: Path,
+    plex_dir: Path,
+    organize_by_site: bool,
+) -> bool:
+    if not (dest and dest.exists()):
+        dest = _latest_media_file(job_tmp_dir)
+    if not (dest and dest.exists()):
+        job.status = "failed"
+        job.eta = "no output file found"
+        return False
+
+    height = _probe_video_height(dest)
+    if height is not None and height < MIN_DOWNLOAD_HEIGHT:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        job.status = "failed"
+        job.progress = 0.0
+        job.eta = f"downloaded format is {height}p; Fetcher requires {MIN_DOWNLOAD_HEIGHT}p+"
+        return False
+
+    final_dir = plex_dir / re.sub(r"[^a-zA-Z0-9._-]+", "-", job.video.site).strip("-") if organize_by_site else plex_dir
+    final_dir.mkdir(parents=True, exist_ok=True)
+    target = final_dir / dest.name
+    try:
+        shutil.move(str(dest), str(target))
+        job.filepath = target
+        job.file_size = target.stat().st_size
+        job.status = "done"
+        job.progress = 100.0
+        quality_note = f" ({height}p)" if height else ""
+        job.eta = f"saved{quality_note}"
+        DOWNLOADED_IDS.parent.mkdir(parents=True, exist_ok=True)
+        with open(DOWNLOADED_IDS, "a") as f:
+            f.write(job.video.id + "\n")
+        return True
+    except Exception as exc:
+        job.status = "failed"
+        job.eta = str(exc)
+        return False
+
+
+def _build_ytdlp_download_cmd(
+    ytdlp_cmd: list[str],
+    job: DownloadJob,
+    job_tmp_dir: Path,
+    filename_template: str,
+    format_selector: str,
+    concurrent_fragments: int,
+    *,
+    force_generic: bool = False,
+) -> list[str]:
+    cmd = [
+        *ytdlp_cmd,
+        "-o", str(job_tmp_dir / (filename_template.strip() or "%(title)s.%(ext)s")),
+        "-f", format_selector,
+        "--merge-output-format", "mkv",
+        "--check-formats",
+        "--no-playlist", "--newline", "--no-warnings",
+        "--retries", "3", "--fragment-retries", "5",
+        "--continue", "--part",
+        "--concurrent-fragments", str(max(1, concurrent_fragments)),
+        "--print", "after_move:__FETCHER_DEST__:%(filepath)s",
+    ]
+    if force_generic:
+        cmd.append("--force-generic-extractor")
+    cmd.extend(_site_ytdlp_args(job.video))
+    cmd.append(_provider_download_url(job.video))
+    return cmd
+
+
+def _is_pornhub_phantomjs_error(error: str) -> bool:
+    lowered = error.lower()
+    return "pornhub" in lowered and "phantomjs" in lowered
+
+
+def _pornhub_media_urls_from_html(text: str) -> list[tuple[int, str]]:
+    match = re.search(r"var\s+flashvars_\d+\s*=\s*({.+?});", text)
+    if not match:
+        return []
+    try:
+        flashvars = json.loads(match.group(1))
+    except ValueError:
+        return []
+
+    urls: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    media_definitions = flashvars.get("mediaDefinitions", [])
+    if not isinstance(media_definitions, list):
+        return []
+    for definition in media_definitions:
+        if not isinstance(definition, dict):
+            continue
+        video_url = definition.get("videoUrl")
+        if not isinstance(video_url, str) or not video_url.startswith("http"):
+            continue
+        if "/video/get_media" in video_url or video_url in seen:
+            continue
+        quality = _parse_quality(definition.get("quality")) or int(definition.get("height") or 0)
+        urls.append((quality, video_url))
+        seen.add(video_url)
+    return sorted(urls, key=lambda item: item[0], reverse=True)
+
+
+def _resolve_pornhub_browser_urls(video: Video) -> tuple[list[str], Optional[str]]:
+    """Use local Chrome only when yt-dlp's PornHub extractor requires PhantomJS."""
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+    except Exception as exc:
+        return [], f"PornHub browser fallback unavailable: {exc}"
+
+    import time as _time
+
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+
+    driver = None
+    try:
+        driver = webdriver.Chrome(options=opts)
+        driver.get(_provider_download_url(video))
+        media_urls: list[tuple[int, str]] = []
+        for _ in range(12):
+            media_urls = _pornhub_media_urls_from_html(driver.page_source)
+            if media_urls:
+                break
+            _time.sleep(1)
+        if not media_urls:
+            return [], "PornHub browser fallback found no media URLs"
+        return [media_urls[0][1]], None
+    except Exception as exc:
+        return [], f"PornHub browser fallback failed: {exc}"
+    finally:
+        if driver is not None:
             try:
-                shutil.move(str(dest), str(target))
-                job.filepath  = target
-                job.file_size = target.stat().st_size
-                job.status    = "done"
-                job.progress  = 100.0
-                with open(DOWNLOADED_IDS, "a") as f:
-                    f.write(job.video.id + "\n")
-            except Exception as e:
-                job.status = "failed"
-                job.eta    = str(e)
+                driver.quit()
+            except Exception:
+                pass
+
+
+def _resolve_direct_download_urls(video: Video, ytdlp_cmd: list[str], *, force_generic: bool) -> tuple[list[str], Optional[str]]:
+    cmd = [
+        *ytdlp_cmd,
+        "-g",
+        "--no-playlist",
+        "-f", YTDLP_FLEX_FORMAT,
+    ]
+    if force_generic:
+        cmd.append("--force-generic-extractor")
+    cmd.extend(_site_ytdlp_args(video))
+    cmd.append(_provider_download_url(video))
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    except Exception as exc:
+        return [], str(exc)
+    urls = [
+        line.strip()
+        for line in proc.stdout.splitlines()
+        if line.strip().startswith("http") and not _is_known_censored_media_url(line.strip())
+    ]
+    if proc.returncode != 0:
+        error = (proc.stderr or proc.stdout).strip() or f"yt-dlp exit {proc.returncode}"
+        if video.site == "PornHub" and not force_generic and _is_pornhub_phantomjs_error(error):
+            browser_urls, browser_error = _resolve_pornhub_browser_urls(video)
+            if browser_urls:
+                return browser_urls, None
+            return urls, browser_error or error
+        return urls, error
+    return urls, None
+
+
+def _run_ffmpeg_fallback(job: DownloadJob, urls: list[str], job_tmp_dir: Path, progress_cb) -> tuple[int, Optional[Path], deque[str]]:
+    if not FFMPEG:
+        return 1, None, deque(["ffmpeg is not installed"], maxlen=12)
+    if not urls:
+        return 1, None, deque(["no direct media URLs found"], maxlen=12)
+    output = job_tmp_dir / f"{_safe_media_stem(job.video)}.mkv"
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "warning"]
+    referer = _provider_download_url(job.video)
+    for url in urls[:2]:
+        url = url.split("#__youtubedl_smuggle=", 1)[0]
+        cmd.extend(["-user_agent", HEADERS["User-Agent"], "-referer", referer, "-i", url])
+    if len(urls) >= 2:
+        cmd.extend(["-map", "0:v:0", "-map", "1:a:0?"])
+    cmd.extend(["-c", "copy", str(output)])
+    job.eta = "ffmpeg fallback"
+    return _run_download_process(job, cmd, progress_cb, expected_dest=output)
+
+
+def run_download(
+    job: DownloadJob,
+    tmp_dir: Path,
+    plex_dir: Path,
+    progress_cb,
+    done_cb,
+    filename_template: str = "%(title)s.%(ext)s",
+    organize_by_site: bool = False,
+    concurrent_fragments: int = 1,
+) -> None:
+    """Download with layered yt-dlp/generic/ffmpeg fallbacks, then verify quality."""
+    job.status = "downloading"
+    job_tmp_dir = _job_temp_dir(tmp_dir, job.video)
+    job_tmp_dir.mkdir(parents=True, exist_ok=True)
+    ytdlp_cmd, ytdlp_error = resolve_ytdlp_command()
+    if ytdlp_error or not ytdlp_cmd:
+        job.status = "failed"
+        job.eta = ytdlp_error or "yt-dlp is unavailable"
+        done_cb(job)
+        return
+
+    attempts = [
+        ("yt-dlp HD", YTDLP_FORMAT, False),
+        ("yt-dlp flexible", YTDLP_FLEX_FORMAT, False),
+        ("yt-dlp generic", YTDLP_FLEX_FORMAT, True),
+    ]
+    last_failure = ""
+    failures: list[str] = []
+    for label, format_selector, force_generic in attempts:
+        job.eta = label
+        progress_cb()
+        cmd = _build_ytdlp_download_cmd(
+            ytdlp_cmd,
+            job,
+            job_tmp_dir,
+            filename_template,
+            format_selector,
+            concurrent_fragments,
+            force_generic=force_generic,
+        )
+        returncode, dest, tail = _run_download_process(job, cmd, progress_cb)
+        if returncode == 0 and _finalize_downloaded_file(job, dest, job_tmp_dir, plex_dir, organize_by_site):
+            break
+        last_failure = job.eta if job.status == "failed" and job.eta else _failure_from_tail(tail, returncode)
+        if last_failure:
+            failures.append(last_failure)
+        job.status = "downloading"
+        job.progress = 0.0
+        job.speed = ""
+    else:
+        for force_generic in (False, True):
+            urls, error = _resolve_direct_download_urls(job.video, ytdlp_cmd, force_generic=force_generic)
+            if not urls:
+                last_failure = error or last_failure
+                if error:
+                    failures.append(error)
+                continue
+            returncode, dest, tail = _run_ffmpeg_fallback(job, urls, job_tmp_dir, progress_cb)
+            if returncode == 0 and _finalize_downloaded_file(job, dest, job_tmp_dir, plex_dir, organize_by_site):
+                break
+            last_failure = job.eta if job.status == "failed" and job.eta else _failure_from_tail(tail, returncode)
+            if last_failure:
+                failures.append(last_failure)
+            job.status = "downloading"
+            job.progress = 0.0
+            job.speed = ""
         else:
             job.status = "failed"
-            job.eta    = "no output file found"
-    else:
-        job.status = "failed"
-        failure_lines = [
-            line for line in reversed(tail)
-            if line and not line.startswith("[download]")
-        ]
-        job.eta = failure_lines[0] if failure_lines else f"exit {proc.returncode}"
+            job.eta = _best_download_failure(failures, last_failure or "all download strategies failed")
 
     try:
         if job_tmp_dir.exists() and not any(job_tmp_dir.iterdir()):
@@ -832,18 +1417,49 @@ def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, d
     done_cb(job)
 
 
+def create_download_manager(
+    settings: AppSettings,
+    tmp_dir: Path,
+    output_dir: Path,
+    *,
+    history_store: Optional[JobHistoryStore] = None,
+) -> DownloadManager:
+    """Adapt the existing downloader and callbacks to the shared job manager."""
+
+    def downloader(job: DownloadJob, progress_cb, done_cb) -> None:
+        run_download(
+            job,
+            tmp_dir,
+            output_dir,
+            progress_cb,
+            done_cb,
+            settings.naming_template,
+            settings.organize_by_site,
+            settings.concurrent_fragments,
+        )
+
+    return DownloadManager(
+        downloader,
+        max_workers=max(1, settings.parallel_downloads),
+        history_store=history_store,
+    )
+
+
 def resolve_stream_urls(video: Video) -> tuple[list[str], Optional[str]]:
     """Resolve direct media URLs for mpv without relying on mpv's yt-dlp hook."""
+    ytdlp_cmd, ytdlp_error = resolve_ytdlp_command()
+    if ytdlp_error or not ytdlp_cmd:
+        return [], ytdlp_error or "yt-dlp is unavailable"
     cmd = [
-        str(YTDLP),
+        *ytdlp_cmd,
         "-g",
         "--no-playlist",
         "-f",
-        "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        YTDLP_FORMAT,
     ]
     if video.site == "Twitter":
         cmd.extend(["--cookies-from-browser", "chrome"])
-    cmd.append(video.url)
+    cmd.append(_provider_download_url(video))
 
     try:
         proc = subprocess.run(
@@ -856,12 +1472,16 @@ def resolve_stream_urls(video: Video) -> tuple[list[str], Optional[str]]:
     except Exception as exc:
         return [], str(exc)
 
-    urls = [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("http")]
+    urls = [
+        line.strip()
+        for line in proc.stdout.splitlines()
+        if line.strip().startswith("http") and not _is_known_censored_media_url(line.strip())
+    ]
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout).strip() or f"yt-dlp exit {proc.returncode}"
         return urls, err
     if not urls:
-        return [], "yt-dlp returned no playable media URL"
+        return [], "yt-dlp returned no uncensored playable media URL"
     return urls, None
 
 
@@ -1065,7 +1685,7 @@ class HelpScreen(ModalScreen):
                 "  d                 Download selected\n"
                 "  p                 Play highlighted result in mpv\n"
                 "  S                 Stop all active downloads\n"
-                "  x                 Clean tmp/ (move mp4, delete partials)\n"
+                "  x                 Clean tmp/ (move media, delete partials)\n"
                 "  ↻ button          Retry a failed download\n\n"
                 "[yellow]Files[/]\n"
                 "  Files tab         Browse the configured output directory\n"
@@ -1143,6 +1763,7 @@ class TwitterLoginScreen(ModalScreen[str]):
                     cookies = json.loads(raw)
                     if not isinstance(cookies, dict) or "auth_token" not in cookies:
                         raise ValueError("JSON must contain auth_token key")
+                    TWITTER_COOKIES.parent.mkdir(parents=True, exist_ok=True)
                     TWITTER_COOKIES.write_text(json.dumps(cookies, indent=2))
                     self.dismiss("Cookies saved.")
                     return
@@ -1154,6 +1775,7 @@ class TwitterLoginScreen(ModalScreen[str]):
             if len(raw) < 20:
                 self.query_one("#tw-login-status", Static).update("[red]Token too short[/]")
                 return
+            TWITTER_COOKIES.parent.mkdir(parents=True, exist_ok=True)
             TWITTER_COOKIES.write_text(json.dumps({"auth_token": raw}, indent=2))
             self.dismiss("auth_token saved.")
 
@@ -1185,10 +1807,10 @@ class SearchFilterScreen(ModalScreen[Optional[SearchFilters]]):
             with Horizontal(classes="settings-row"):
                 yield Label("Min Quality")
                 yield Select(
-                    [("Any", "any"), ("360p+", "360"), ("480p+", "480"), ("720p+", "720"), ("1080p+", "1080")],
+                    [("720p+", "720"), ("1080p+", "1080")],
                     id="filter-min-quality",
                     allow_blank=False,
-                    value=self._filters.min_quality,
+                    value=normalize_min_quality(self._filters.min_quality),
                 )
             with Horizontal(classes="settings-row"):
                 yield Label("Min Rating %")
@@ -1223,7 +1845,7 @@ class SearchFilterScreen(ModalScreen[Optional[SearchFilters]]):
         self.dismiss(SearchFilters(
             min_duration_min=min_duration,
             max_duration_min=max_duration,
-            min_quality=str(self.query_one("#filter-min-quality", Select).value or "any"),  # type: ignore[arg-type]
+            min_quality=normalize_min_quality(self.query_one("#filter-min-quality", Select).value),
             min_rating=min_rating,
             hd_only=self.query_one("#filter-hd-only", Checkbox).value,
             pages=pages,
@@ -1472,10 +2094,7 @@ class FetchTUI(App):
     def __init__(self) -> None:
         super().__init__()
         self.settings = load_settings()
-        self._tmp_dir = self.settings.tmp_path
-        self._plex_dir = self.settings.plex_path
-        self._tmp_dir.mkdir(parents=True, exist_ok=True)
-        self._plex_dir.mkdir(parents=True, exist_ok=True)
+        self._tmp_dir, self._plex_dir, self._startup_warnings = resolve_runtime_dirs(self.settings)
         # Shared state
         ids, titles = load_downloaded(self._plex_dir)
         self._downloaded:        set[str] = ids
@@ -1635,6 +2254,9 @@ class FetchTUI(App):
         self.query_one("#files-path", Static).update(str(self._plex_dir))
 
         self._log(f"Ready. {len(self._downloaded)} known downloads.")
+        for warning in self._startup_warnings:
+            self._log(warning)
+            self._set_settings_status(warning)
         if self._tw_logged_in:
             self._log("Twitter: cookies loaded.")
         else:
@@ -1642,7 +2264,7 @@ class FetchTUI(App):
 
         moved, deleted = cleanup_tmp(self._tmp_dir, self._plex_dir)
         if moved or deleted:
-            self._log(f"tmp/ cleanup: {moved} mp4 moved to plex, {deleted} partials deleted.")
+            self._log(f"tmp/ cleanup: {moved} media file(s) moved to plex, {deleted} partials deleted.")
 
     def _log(self, msg: str) -> None:
         self.query_one("#app-log", Log).write_line(msg)
@@ -1657,8 +2279,8 @@ class FetchTUI(App):
         theme_select.value = self.settings.theme
         self.query_one("#settings-thumbnails", Checkbox).value = self.settings.thumbnails_enabled
         self.query_one("#settings-video-previews", Checkbox).value = self.settings.video_previews_enabled
-        self.query_one("#settings-plex-dir", Input).value = str(self._plex_dir)
-        self.query_one("#settings-tmp-dir", Input).value = str(self._tmp_dir)
+        self.query_one("#settings-plex-dir", Input).value = self.settings.plex_dir
+        self.query_one("#settings-tmp-dir", Input).value = self.settings.tmp_dir
         self.query_one("#settings-parallel", Input).value = str(self.settings.parallel_downloads)
         self._set_settings_status("")
 
@@ -1708,7 +2330,9 @@ class FetchTUI(App):
         norm = _normalize_title(video.title)
         if not self._plex_dir.exists():
             return None
-        for path in self._plex_dir.glob("*.mp4"):
+        for path in self._plex_dir.iterdir():
+            if path.suffix.lower() not in MEDIA_EXTENSIONS:
+                continue
             if _normalize_title(path.stem) == norm:
                 return path
         return None
@@ -2012,7 +2636,9 @@ class FetchTUI(App):
     def _load_files(self) -> None:
         entries: list[FileEntry] = []
         if self._plex_dir.exists():
-            for path in sorted(self._plex_dir.rglob("*.mp4")):
+            for path in sorted(self._plex_dir.rglob("*")):
+                if path.suffix.lower() not in MEDIA_EXTENSIONS:
+                    continue
                 try:
                     stat = path.stat()
                 except OSError:
@@ -2029,14 +2655,7 @@ class FetchTUI(App):
         if entry is None:
             info.update("Select a file to preview it here.")
             return
-        info.update(
-            Text.from_markup(
-                f"[bold]{entry.name}[/]\n"
-                f"Size: {_fmt_size(entry.size)}\n"
-                f"Modified: {entry.modified_str}\n"
-                f"[dim]{entry.path}[/]"
-            )
-        )
+        info.update(_file_preview_text(entry))
 
     @on(Button.Pressed, "#btn-search")
     def _porn_btn(self) -> None:
@@ -2084,6 +2703,8 @@ class FetchTUI(App):
             found = SITE_FN[s](query, min_s, max_s, pages)
             results.extend(found)
             self.call_from_thread(self._log, f"  {s}: {len(found)} results")
+            if not found and s in LAST_PROVIDER_ERRORS:
+                self.call_from_thread(self._log, f"  {s}: {LAST_PROVIDER_ERRORS[s]}")
 
         results = [video for video in results if self._video_matches_search_filters(video)]
         seen_ids: set[str] = set()
@@ -2397,11 +3018,8 @@ class FetchTUI(App):
     @on(Button.Pressed, "#btn-settings-reload")
     def _settings_reload_btn(self) -> None:
         self.settings = load_settings()
-        self._tmp_dir = self.settings.tmp_path
-        self._plex_dir = self.settings.plex_path
+        self._tmp_dir, self._plex_dir, warnings = resolve_runtime_dirs(self.settings)
         self._download_parallel = max(1, self.settings.parallel_downloads)
-        self._tmp_dir.mkdir(parents=True, exist_ok=True)
-        self._plex_dir.mkdir(parents=True, exist_ok=True)
         self.theme = self.settings.theme
         self._reload_downloaded_cache()
         self._populate_settings_controls()
@@ -2409,8 +3027,11 @@ class FetchTUI(App):
         self.query_one("#parallel", Input).value = str(self.settings.parallel_downloads)
         self._load_files()
         self._refresh_player_status()
-        self._set_settings_status("Settings reloaded.")
+        status = warnings[0] if warnings else "Settings reloaded."
+        self._set_settings_status(status)
         self._log("Settings reloaded from disk.")
+        for warning in warnings:
+            self._log(warning)
 
     @on(Button.Pressed, "#btn-settings-save")
     def _settings_save_btn(self) -> None:
@@ -2430,23 +3051,28 @@ class FetchTUI(App):
             theme=theme,
             thumbnails_enabled=self.query_one("#settings-thumbnails", Checkbox).value,
             video_previews_enabled=self.query_one("#settings-video-previews", Checkbox).value,
-            plex_dir=str(Path(plex_dir_raw).expanduser()),
-            tmp_dir=str(Path(tmp_dir_raw).expanduser()),
+            plex_dir=plex_dir_raw,
+            tmp_dir=tmp_dir_raw,
             parallel_downloads=parallel,
+            searxng_url=self.settings.searxng_url,
+            searxng_enabled=self.settings.searxng_enabled,
+            searxng_categories=self.settings.searxng_categories,
+            naming_template=self.settings.naming_template,
+            organize_by_site=self.settings.organize_by_site,
+            concurrent_fragments=self.settings.concurrent_fragments,
             search_filters=self.settings.search_filters,
         )
 
         try:
-            new_settings.tmp_path.mkdir(parents=True, exist_ok=True)
-            new_settings.plex_path.mkdir(parents=True, exist_ok=True)
+            new_settings, tmp_dir, plex_dir, warnings = prepare_runtime_settings(new_settings)
             save_settings(new_settings)
         except Exception as exc:
             self._set_settings_status(f"Failed to save settings: {exc}")
             return
 
         self.settings = new_settings
-        self._tmp_dir = self.settings.tmp_path
-        self._plex_dir = self.settings.plex_path
+        self._tmp_dir = tmp_dir
+        self._plex_dir = plex_dir
         self._download_parallel = max(1, self.settings.parallel_downloads)
         self.theme = self.settings.theme
         self._reload_downloaded_cache()
@@ -2454,11 +3080,13 @@ class FetchTUI(App):
         self.query_one("#parallel", Input).value = str(self.settings.parallel_downloads)
         self._load_files()
         self._refresh_player_status()
-        self._set_settings_status("Settings saved.")
+        self._set_settings_status(warnings[0] if warnings else "Settings saved.")
         self._log(
             f"Settings saved. theme={self.settings.theme} parallel={self.settings.parallel_downloads} "
             f"plex={self._plex_dir} tmp={self._tmp_dir}"
         )
+        for warning in warnings:
+            self._log(warning)
 
     def _dispatch_downloads(self) -> None:
         active = sum(
@@ -2619,7 +3247,7 @@ class FetchTUI(App):
     # ── Clean tmp ─────────────────────────────────────────────────────────────
     def action_clean_tmp(self) -> None:
         moved, deleted = cleanup_tmp(self._tmp_dir, self._plex_dir)
-        self._log(f"tmp/ cleanup: {moved} mp4 → plex, {deleted} partials deleted.")
+        self._log(f"tmp/ cleanup: {moved} media file(s) moved to plex, {deleted} partials deleted.")
 
     # ── Quit with guard ───────────────────────────────────────────────────────
     def action_quit_app(self) -> None:
@@ -2649,10 +3277,11 @@ def run_tui() -> int:
 
 
 def build_parser() -> ArgumentParser:
-    parser = ArgumentParser(prog="fetcher", description="Fetcher v1.0 CLI and TUI")
+    parser = ArgumentParser(prog="fetcher", description="Fetcher v1.0 GUI, CLI, and TUI")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("tui", help="Launch the Textual UI")
+    sub.add_parser("gui", help="Launch the native desktop GUI")
 
     search = sub.add_parser("search", help="Search and print matching videos")
     search.add_argument("query")
@@ -2660,7 +3289,7 @@ def build_parser() -> ArgumentParser:
     search.add_argument("--pages", type=int)
     search.add_argument("--min-duration", type=int, dest="min_duration")
     search.add_argument("--max-duration", type=int, dest="max_duration")
-    search.add_argument("--min-quality", choices=["any", "360", "480", "720", "1080"])
+    search.add_argument("--min-quality", choices=["720", "1080"])
     search.add_argument("--min-rating", type=int)
     search.add_argument("--hd-only", action="store_true")
     search.add_argument("--exclude")
@@ -2680,7 +3309,7 @@ def build_parser() -> ArgumentParser:
     batch.add_argument("--pages", type=int)
     batch.add_argument("--min-duration", type=int, dest="min_duration")
     batch.add_argument("--max-duration", type=int, dest="max_duration")
-    batch.add_argument("--min-quality", choices=["any", "360", "480", "720", "1080"])
+    batch.add_argument("--min-quality", choices=["720", "1080"])
     batch.add_argument("--min-rating", type=int)
     batch.add_argument("--hd-only", action="store_true")
     batch.add_argument("--exclude")
@@ -2698,6 +3327,9 @@ def cli_search(args: Namespace, settings: AppSettings) -> int:
     filters = build_filters_from_args(args, settings)
     results = search_videos(args.query, args.site, filters, twitter_count=args.count)
     results.sort(key=lambda video: video.views, reverse=True)
+    for site, error in sorted(LAST_PROVIDER_ERRORS.items()):
+        if args.site in ("All Sites", site):
+            print(f"Warning: {site}: {error}", file=sys.stderr)
     if args.json:
         print(json.dumps([video_to_dict(video) for video in (results[:args.limit] if args.limit else results)], indent=2))
     else:
@@ -2706,10 +3338,17 @@ def cli_search(args: Namespace, settings: AppSettings) -> int:
 
 
 def cli_download(args: Namespace, settings: AppSettings) -> int:
-    output_dir = Path(args.output_dir).expanduser() if args.output_dir else settings.plex_path
-    tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else settings.tmp_path
-    output_dir.mkdir(parents=True, exist_ok=True)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    if args.output_dir or args.tmp_dir:
+        output_dir = Path(args.output_dir).expanduser() if args.output_dir else settings.plex_path
+        tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else settings.tmp_path
+        tmp_dir, output_dir, warnings = resolve_runtime_dirs(
+            AppSettings(plex_dir=str(output_dir), tmp_dir=str(tmp_dir))
+        )
+    else:
+        tmp_dir, output_dir, warnings = resolve_runtime_dirs(settings)
+
+    for warning in warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
 
     exit_code = 0
     for target in args.targets:
@@ -2736,8 +3375,18 @@ def cli_batch(args: Namespace, settings: AppSettings) -> int:
     if args.json:
         print(json.dumps([video_to_dict(video) for video in selected], indent=2))
 
-    output_dir = Path(args.output_dir).expanduser() if args.output_dir else settings.plex_path
-    tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else settings.tmp_path
+    if args.output_dir or args.tmp_dir:
+        output_dir = Path(args.output_dir).expanduser() if args.output_dir else settings.plex_path
+        tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else settings.tmp_path
+        tmp_dir, output_dir, warnings = resolve_runtime_dirs(
+            AppSettings(plex_dir=str(output_dir), tmp_dir=str(tmp_dir))
+        )
+    else:
+        tmp_dir, output_dir, warnings = resolve_runtime_dirs(settings)
+
+    for warning in warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+
     jobs = run_batch_download(selected, tmp_dir, output_dir, parallel=max(1, args.parallel))
 
     failures = [job for job in jobs if job.status != "done"]
@@ -2747,6 +3396,17 @@ def cli_batch(args: Namespace, settings: AppSettings) -> int:
     return 1 if failures else 0
 
 
+def _run_gui(argv: Optional[list[str]] = None) -> int:
+    from fetcher_gui.app import run_gui
+
+    return run_gui(argv)
+
+
+def gui_main() -> int:
+    """Installed native-GUI entry point with dependency guidance."""
+    return main(["gui", *sys.argv[1:]])
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -2754,6 +3414,19 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.command in (None, "tui"):
         return run_tui()
+    if args.command == "gui":
+        try:
+            return _run_gui([])
+        except ModuleNotFoundError as exc:
+            if exc.name != "PySide6" and not (exc.name or "").startswith("PySide6."):
+                raise
+            print(
+                "Fetcher GUI requires PySide6. Install it with "
+                "`python -m pip install 'fetcher-v1[gui]'` or "
+                "`python -m pip install PySide6`.",
+                file=sys.stderr,
+            )
+            return 2
     if args.command == "search":
         return cli_search(args, settings)
     if args.command == "download":
