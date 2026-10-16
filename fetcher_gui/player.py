@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QUrl, Slot
+from PySide6.QtCore import QEvent, Qt, QUrl, Slot
+from PySide6.QtGui import QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -11,6 +12,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSlider,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -41,9 +43,20 @@ class MediaPlayerWidget(QWidget):
         self.audio_output = audio_output if audio_output is not None else QAudioOutput(self)
         self.video_widget = video_widget if video_widget is not None else QVideoWidget(self)
         self._scrubbing = False
+        self._thumbnail_pixmap: QPixmap | None = None
 
         self.player.setAudioOutput(self.audio_output)
         self.player.setVideoOutput(self.video_widget)
+        self.thumbnail_label = QLabel("Highlight a result to preview it here.", self)
+        self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumbnail_label.setWordWrap(True)
+        self.thumbnail_label.setStyleSheet("background-color: #000000; color: #9aa0a6;")
+        self.video_widget.setStyleSheet("background-color: #000000;")
+        self.display_stack = QStackedWidget(self)
+        self.display_stack.addWidget(self.thumbnail_label)
+        self.display_stack.addWidget(self.video_widget)
+        self.display_stack.setCurrentWidget(self.thumbnail_label)
+        self.thumbnail_label.installEventFilter(self)
 
         self.play_button = QPushButton("Play", self)
         self.mute_button = QPushButton("Mute", self)
@@ -72,7 +85,7 @@ class MediaPlayerWidget(QWidget):
         controls.addWidget(self.full_screen_button)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self.video_widget, 1)
+        layout.addWidget(self.display_stack, 1)
         layout.addLayout(seek_row)
         layout.addLayout(controls)
         layout.addWidget(self.error_label)
@@ -101,7 +114,50 @@ class MediaPlayerWidget(QWidget):
             url = QUrl(source)
         else:
             url = QUrl.fromLocalFile(str(Path(source).expanduser().resolve()))
+        self.display_stack.setCurrentWidget(self.video_widget)
         self.player.setSource(url)
+
+    def show_thumbnail(self, video, pixmap: QPixmap | None = None) -> None:
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
+            self.player.stop()
+        self.display_stack.setCurrentWidget(self.thumbnail_label)
+        if pixmap is not None and not pixmap.isNull():
+            self._thumbnail_pixmap = pixmap
+            self.thumbnail_label.setText("")
+            self._apply_thumbnail_pixmap()
+            return
+        self._thumbnail_pixmap = None
+        self.thumbnail_label.setPixmap(QPixmap())
+        if pixmap is not None or video is None or not getattr(video, "thumbnail_url", None):
+            self.thumbnail_label.setText(
+                "Thumbnail unavailable" if video is not None else "Highlight a result to preview it here."
+            )
+        else:
+            self.thumbnail_label.setText("Loading thumbnail…")
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.thumbnail_label and event.type() == QEvent.Type.Resize:
+            self._apply_thumbnail_pixmap()
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_thumbnail_pixmap()
+
+    def _apply_thumbnail_pixmap(self) -> None:
+        if self._thumbnail_pixmap is None or self._thumbnail_pixmap.isNull():
+            return
+        target = self.thumbnail_label.size()
+        if target.width() < 2 or target.height() < 2:
+            self.thumbnail_label.setPixmap(self._thumbnail_pixmap)
+            return
+        self.thumbnail_label.setPixmap(
+            self._thumbnail_pixmap.scaled(
+                target,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
     @Slot()
     def toggle_playback(self) -> None:

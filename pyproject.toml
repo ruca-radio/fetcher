@@ -26,6 +26,9 @@ keywords = ["cli", "downloader", "terminal", "textual", "yt-dlp"]
 gui = [
   "PySide6>=6.8,<7",
 ]
+fast = [
+  "aria2==0.0.1b0",
+]
 test = [
   "pytest>=8",
   "pytest-qt>=4.4",

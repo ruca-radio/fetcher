@@ -9,11 +9,7 @@ from typing import Any, Callable, Optional
 
 from .models import (
     AppSettings,
-    DEFAULT_EXCLUDE_PHRASES,
     DEFAULT_MIN_QUALITY,
-    DEFAULT_OUTPUT_DIR,
-    DEFAULT_SEARXNG_URL,
-    DEFAULT_TMP_DIR,
     MUTABLE_ROOT,
     STATE_DIR,
     SearchFilters,
@@ -69,6 +65,14 @@ def _portable_path(value: str) -> str:
 def _clamped_int(value: object, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _clamped_float(value: object, default: float, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(maximum, parsed))
@@ -223,6 +227,15 @@ class SettingsStore:
                 naming_template=str(data.get("naming_template", self.defaults.naming_template)),
                 organize_by_site=bool(data.get("organize_by_site", self.defaults.organize_by_site)),
                 concurrent_fragments=int(data.get("concurrent_fragments", self.defaults.concurrent_fragments)),
+                min_download_height=_clamped_int(
+                    data.get("min_download_height"), self.defaults.min_download_height, 0, 4320
+                ),
+                eporner_preview_ratio=_clamped_float(
+                    data.get("eporner_preview_ratio"), self.defaults.eporner_preview_ratio, 0.1, 1.0
+                ),
+                eporner_preview_min_seconds=_clamped_int(
+                    data.get("eporner_preview_min_seconds"), self.defaults.eporner_preview_min_seconds, 0, 3600
+                ),
                 search_filters=SearchFilters(
                     min_duration_min=int(search_data.get("min_duration_min", self.defaults.search_filters.min_duration_min) or 0),
                     max_duration_min=int(search_data.get("max_duration_min", self.defaults.search_filters.max_duration_min) or 0),
@@ -231,6 +244,7 @@ class SettingsStore:
                     hd_only=bool(search_data.get("hd_only", self.defaults.search_filters.hd_only)),
                     pages=int(search_data.get("pages", self.defaults.search_filters.pages) or 1),
                     exclude_phrases=str(search_data.get("exclude_phrases", self.defaults.search_filters.exclude_phrases)),
+                    exclude_censored=bool(search_data.get("exclude_censored", self.defaults.search_filters.exclude_censored)),
                 ),
             )
         except (TypeError, ValueError) as exc:
@@ -269,6 +283,13 @@ class SettingsStore:
             tmp_dir=tmp_dir,
             parallel_downloads=max(1, min(16, settings.parallel_downloads)),
             concurrent_fragments=max(1, min(32, settings.concurrent_fragments)),
+            min_download_height=_clamped_int(settings.min_download_height, self.defaults.min_download_height, 0, 4320),
+            eporner_preview_ratio=_clamped_float(
+                settings.eporner_preview_ratio, self.defaults.eporner_preview_ratio, 0.1, 1.0
+            ),
+            eporner_preview_min_seconds=_clamped_int(
+                settings.eporner_preview_min_seconds, self.defaults.eporner_preview_min_seconds, 0, 3600
+            ),
             search_filters=filters,
         )
 
@@ -302,6 +323,9 @@ class SettingsStore:
 
     def save_gui_preferences(self, preferences: dict[str, object]) -> dict[str, object]:
         loaded = self.load()
+        return self.save_all(loaded.settings, preferences)
+
+    def save_all(self, settings: AppSettings, preferences: dict[str, object]) -> dict[str, object]:
         normalized = _normalize_gui_preferences(preferences)
         existing_gui = self._unknown.get("gui")
         self._unknown["gui"] = {
@@ -309,7 +333,7 @@ class SettingsStore:
             **normalized,
             "staging_dir": _portable_path(str(normalized["staging_dir"])),
         }
-        self.save(loaded.settings)
+        self.save(settings)
         return normalized
 
     def save(self, settings: AppSettings) -> None:

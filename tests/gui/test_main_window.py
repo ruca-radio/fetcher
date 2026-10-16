@@ -6,12 +6,12 @@ import threading
 import time
 from types import SimpleNamespace
 
-from PySide6.QtCore import QThreadPool, Qt
-from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QWidget
+from PySide6.QtCore import QEvent, QSize, QThreadPool, Qt
+from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtWidgets import QApplication, QHeaderView, QWidget
 
 from fetcher_core.jobs import JobSnapshot
-from fetcher_core.models import AppSettings, Video
+from fetcher_core.models import AppSettings, SearchFilters, Video
 from fetcher_core.storage import StorageEntry, TargetExistsError
 from fetcher_gui.discover import DiscoverPage
 from fetcher_gui.downloads import DownloadsPage
@@ -126,9 +126,13 @@ class StubPlayer(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.sources: list[Path | str] = []
+        self.thumbnails: list[tuple[object, object]] = []
 
     def set_source(self, source):
         self.sources.append(source)
+
+    def show_thumbnail(self, video, pixmap=None):
+        self.thumbnails.append((video, pixmap))
 
 
 class SaturatedPool:
@@ -152,6 +156,47 @@ def test_main_window_has_four_workspaces_and_retains_player(qtbot) -> None:
     assert window.library_page.confirm is not None
     window.library_page.preview_ready.emit(Path("/tmp/library.mp4"))
     assert player.sources == [Path("/tmp/library.mp4")]
+
+
+def test_main_window_initializes_discover_from_persisted_search_filters(qtbot) -> None:
+    settings = StubSettings()
+    settings.settings = replace(
+        settings.settings,
+        search_filters=replace(
+            settings.settings.search_filters,
+            min_duration_min=5,
+            max_duration_min=30,
+            min_rating=80,
+            min_quality="1080",
+            hd_only=True,
+            pages=3,
+            exclude_phrases="oral, anal",
+        ),
+    )
+
+    window = MainWindow(download_manager=StubJobs(), local_storage=StubStorage("local"),
+                        plex_storage=StubStorage("plex"), settings_service=settings)
+    qtbot.addWidget(window)
+
+    assert window.discover_page.search_filters() == {
+        "min_duration": 5, "max_duration": 30, "min_rating": 80, "quality": "1080",
+        "hd_only": True, "exclude": "oral, anal", "pages": 3,
+    }
+
+
+def test_library_refreshes_once_when_first_navigated_to(qtbot) -> None:
+    local, plex = StubStorage("local"), StubStorage("plex")
+    window = MainWindow(download_manager=StubJobs(), local_storage=local, plex_storage=plex,
+                        settings_service=StubSettings(), thread_pool=QThreadPool())
+    qtbot.addWidget(window)
+
+    assert local.list_calls == plex.list_calls == 0
+    window.navigation_buttons[2].click()
+    qtbot.waitUntil(lambda: local.list_calls == plex.list_calls == 1, timeout=2_000)
+    window.navigation_buttons[0].click()
+    window.navigation_buttons[2].click()
+
+    assert local.list_calls == plex.list_calls == 1
 
 
 def test_discover_ignores_stale_search_and_preview_results(qtbot) -> None:
@@ -180,10 +225,272 @@ def test_discover_exposes_quality_duration_and_rating_filters(qtbot) -> None:
     page.max_duration_spin.setValue(30)
     page.min_rating_spin.setValue(80)
     page.quality_combo.setCurrentText("1080")
+    page.hd_only_checkbox.setChecked(True)
+    page.exclude_edit.setText("oral, anal")
+    page.pages_spin.setValue(3)
 
     assert page.search_filters() == {
-        "min_duration": 5, "max_duration": 30, "min_rating": 80, "quality": "1080"
+        "min_duration": 5, "max_duration": 30, "min_rating": 80, "quality": "1080",
+        "hd_only": True, "exclude": "oral, anal", "pages": 3,
     }
+
+
+def test_discover_table_fits_160x90_thumbnails(qtbot) -> None:
+    page = DiscoverPage(StubSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    page.show()
+    page.results_model.set_results([Video("one", "One", 120, 1000, "https://one", "Eporner")])
+
+    assert page.results_view.iconSize() == QSize(160, 90)
+    assert page.results_view.verticalHeader().defaultSectionSize() >= 90
+    assert page.results_view.rowHeight(0) >= 90
+    assert page.results_view.horizontalHeader().sectionResizeMode(0) == QHeaderView.ResizeMode.Stretch
+
+
+def test_discover_clicking_a_row_previews_thumbnail_without_resolving_media(qtbot) -> None:
+    preview = StubPreview()
+    resolved: list[Video] = []
+    original = preview.resolve
+    preview.resolve = lambda video: resolved.append(video) or original(video)
+    page = DiscoverPage(StubSearch(), preview, StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    video = Video("one", "One", 1, 1, "https://one", "Eporner", thumbnail_url="https://thumb")
+    pixmap = QPixmap(160, 90)
+    pixmap.fill(Qt.GlobalColor.red)
+    focused: list[tuple[object, object]] = []
+    page.focused_result.connect(lambda item, image: focused.append((item, image)))
+    page.results_model.set_results([video])
+    page.results_model.set_thumbnail(video.site, video.id, pixmap)
+
+    page.results_view.selectRow(0)
+
+    assert resolved == []
+    assert focused
+    shown_video, shown_pixmap = focused[-1]
+    assert shown_video.id == "one"
+    assert shown_pixmap is not None
+    assert not shown_pixmap.isNull()
+
+
+def test_discover_hover_previews_another_result_and_leave_restores_pinned(qtbot) -> None:
+    page = DiscoverPage(StubSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    pinned = Video("pinned", "Pinned", 1, 1, "https://pinned", "Eporner", thumbnail_url="https://p")
+    hovered = Video("hovered", "Hovered", 1, 1, "https://hovered", "Eporner", thumbnail_url="https://h")
+    pinned_thumb, hovered_thumb = QPixmap(160, 90), QPixmap(160, 90)
+    pinned_thumb.fill(Qt.GlobalColor.red)
+    hovered_thumb.fill(Qt.GlobalColor.blue)
+    page.results_model.set_results([pinned, hovered])
+    page.results_model.set_thumbnail(pinned.site, pinned.id, pinned_thumb)
+    page.results_model.set_thumbnail(hovered.site, hovered.id, hovered_thumb)
+    focused: list[str] = []
+    page.focused_result.connect(lambda video, _pixmap: focused.append(video.id if video else ""))
+    page.results_view.selectRow(0)
+
+    page.results_view.entered.emit(page.results_model.index(1, 0))
+    QApplication.sendEvent(page.results_view.viewport(), QEvent(QEvent.Type.Leave))
+
+    assert focused[-3:] == ["pinned", "hovered", "pinned"]
+    assert page.results_view.selectionModel().selectedRows()[0].row() == 0
+
+
+def test_discover_late_thumbnail_updates_active_preview(qtbot) -> None:
+    page = DiscoverPage(StubSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    video = Video("late", "Late", 1, 1, "https://late", "Eporner", thumbnail_url="https://image")
+    focused: list[tuple[object, object]] = []
+    page.focused_result.connect(lambda item, image: focused.append((item, image)))
+    generation = page.begin_search_generation()
+    page.results_model.set_results([video])
+    page.results_view.selectRow(0)
+    assert focused[-1][1] is None
+
+    page._accept_thumbnail(generation, video.site, video.id, QPixmap(160, 90))
+
+    assert focused[-1][0].id == "late"
+    assert focused[-1][1] is not None
+    assert not focused[-1][1].isNull()
+
+
+def test_hover_and_late_thumbnails_do_not_interrupt_preview_playback(qtbot):
+    page = DiscoverPage(StubSearch(), StubPreview(), StubJobs())
+    qtbot.addWidget(page)
+    item = Video("one", "One", 1, 1, "https://one", "Test")
+    page.results_model.set_results([item])
+    page.results_view.selectRow(0)
+    page.accept_preview_result(page.preview_generation, "https://media.test/full.mp4")
+    focused = []
+    page.focused_result.connect(lambda *args: focused.append(args))
+    page._result_entered(page.results_model.index(0, 0))
+    page._accept_thumbnail(page.search_generation, item.site, item.id, QPixmap(160, 90))
+    page._leave_results()
+    assert focused == []
+
+
+def test_search_adapter_preserves_disabled_censored_filter():
+    seen = []
+    module = SimpleNamespace(search_videos=lambda query, provider, filters, **kwargs: seen.append(filters) or [])
+    settings = AppSettings(search_filters=SearchFilters(exclude_censored=False))
+    gui_app.SearchAdapter(module, settings).search("query", "Eporner", {})
+    assert seen[0].exclude_censored is False
+
+
+def test_discover_search_pool_can_shutdown_without_waiting_for_network(qtbot):
+    started = threading.Event()
+    release = threading.Event()
+    class Search:
+        def search(self, *args):
+            started.set()
+            release.wait(2)
+            return []
+    page = DiscoverPage(Search(), StubPreview(), StubJobs())
+    qtbot.addWidget(page)
+    page.query_edit.setText("query")
+    page.search()
+    qtbot.waitUntil(started.is_set)
+    try:
+        assert isinstance(page._search_pool, DaemonTaskPool)
+        start = time.monotonic()
+        page.invalidate()
+        assert time.monotonic() - start < 0.2
+    finally:
+        release.set()
+
+
+def test_discover_equal_ids_from_different_providers_preview_correct_thumbnail(qtbot) -> None:
+    page = DiscoverPage(StubSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    eporner = Video("shared", "Eporner", 1, 1, "https://eporner/shared", "Eporner")
+    redtube = Video("shared", "RedTube", 1, 1, "https://redtube/shared", "RedTube")
+    eporner_thumb, redtube_thumb = QPixmap(160, 90), QPixmap(160, 90)
+    eporner_thumb.fill(Qt.GlobalColor.red)
+    redtube_thumb.fill(Qt.GlobalColor.blue)
+    page.results_model.set_results([eporner, redtube])
+    page.results_model.set_thumbnail("Eporner", "shared", eporner_thumb)
+    page.results_model.set_thumbnail("RedTube", "shared", redtube_thumb)
+    focused: list[tuple[str, QColor]] = []
+    page.focused_result.connect(
+        lambda video, pixmap: focused.append((video.site, pixmap.toImage().pixelColor(0, 0)))
+    )
+
+    page.results_view.selectRow(0)
+    page.results_view.selectRow(1)
+
+    assert focused[-2] == ("Eporner", QColor(Qt.GlobalColor.red))
+    assert focused[-1] == ("RedTube", QColor(Qt.GlobalColor.blue))
+
+
+def test_discover_thumbnail_failure_uses_placeholder_without_search_error(qtbot) -> None:
+    def fail(_url: str):
+        raise ValueError("Unable to decode thumbnail")
+
+    page = DiscoverPage(StubSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool(),
+                        thumbnail_loader=fail)
+    qtbot.addWidget(page)
+    video = Video("bad", "Bad", 1, 1, "https://bad", "Eporner", thumbnail_url="https://image")
+    focused: list[tuple[object, object]] = []
+    page.focused_result.connect(lambda item, image: focused.append((item, image)))
+    page.accept_search_result(page.begin_search_generation(), [video])
+    page.results_view.selectRow(0)
+    qtbot.waitUntil(
+        lambda: any(item[1] is not None and item[1].isNull() for item in focused),
+        timeout=2_000,
+    )
+
+    assert page.error_label.text() == ""
+
+
+def test_main_window_routes_focused_result_to_player_thumbnail(qtbot) -> None:
+    player = StubPlayer()
+    window = MainWindow(search_service=StubSearch(), preview_service=StubPreview(),
+                        download_manager=StubJobs(), local_storage=StubStorage("local"),
+                        plex_storage=StubStorage("plex"), settings_service=StubSettings(),
+                        player=player, thread_pool=QThreadPool())
+    qtbot.addWidget(window)
+    video = Video("one", "One", 1, 1, "https://one", "Eporner")
+    pixmap = QPixmap(160, 90)
+    pixmap.fill(Qt.GlobalColor.red)
+    window.discover_page.results_model.set_results([video])
+    window.discover_page.results_model.set_thumbnail(video.site, video.id, pixmap)
+
+    window.discover_page.results_view.selectRow(0)
+
+    assert player.sources == []
+    assert player.thumbnails
+    assert player.thumbnails[-1][0].id == "one"
+    assert player.thumbnails[-1][1] is not None
+
+
+def test_discover_search_shows_searching_status_then_results(qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowSearch:
+        def search(self, query: str, provider: str, filters: dict[str, object]):
+            started.set()
+            release.wait(timeout=2)
+            return [Video(query, query, 60, 1, f"https://example/{query}", provider)]
+
+    page = DiscoverPage(SlowSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    page.query_edit.setText("blonde")
+
+    page.search()
+    qtbot.waitUntil(started.is_set, timeout=2_000)
+    assert "searching" in page.error_label.text().lower()
+    release.set()
+    qtbot.waitUntil(lambda: page.results_model.rowCount() == 1, timeout=2_000)
+    assert page.results_model.video_at(0).id == "blonde"
+
+
+def test_discover_empty_search_results_are_visible(qtbot) -> None:
+    class EmptySearch:
+        def search(self, query: str, provider: str, filters: dict[str, object]):
+            return []
+
+    page = DiscoverPage(EmptySearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    page.query_edit.setText("blonde")
+    page.search()
+    qtbot.waitUntil(lambda: "no video" in page.error_label.text().lower(), timeout=2_000)
+    assert page.results_model.rowCount() == 0
+
+
+def test_discover_search_is_not_blocked_by_busy_thumbnail_pool(qtbot) -> None:
+    gate = threading.Event()
+
+    class ReadySearch:
+        def search(self, query: str, provider: str, filters: dict[str, object]):
+            return [Video(query, query, 60, 1, f"https://example/{query}", provider)]
+
+    pool = DaemonTaskPool(max_workers=1, max_pending=2)
+    page = DiscoverPage(ReadySearch(), StubPreview(), StubJobs(), thread_pool=pool)
+    qtbot.addWidget(page)
+    pool.start(lambda: gate.wait())
+    qtbot.waitUntil(lambda: pool.activeThreadCount() == 1, timeout=2_000)
+    page.query_edit.setText("blonde")
+
+    page.search()
+    qtbot.waitUntil(lambda: page.results_model.rowCount() == 1, timeout=2_000)
+    gate.set()
+
+
+def test_search_adapter_returns_provider_errors_with_empty_results() -> None:
+    class Module:
+        LAST_PROVIDER_ERRORS: dict[str, str] = {}
+
+        def search_videos(self, query, provider, filters, twitter_count=40):
+            self.LAST_PROVIDER_ERRORS["PornHub"] = "regional access blocked"
+            return []
+
+    result = gui_app.SearchAdapter(Module(), AppSettings()).search(
+        "blonde", "PornHub",
+        {"min_duration": 0, "max_duration": 0, "min_rating": 0, "quality": "any"},
+    )
+
+    assert result["results"] == []
+    assert "PornHub" in result["warning"]
+    assert "blocked" in result["warning"]
 
 
 def test_discover_loads_thumbnails_reports_errors_and_queues_off_thread(qtbot) -> None:
@@ -194,7 +501,7 @@ def test_discover_loads_thumbnails_reports_errors_and_queues_off_thread(qtbot) -
     qtbot.addWidget(page)
     video = Video("thumb", "Thumb", 1, 1, "https://video", "Eporner", thumbnail_url="https://image")
     page.accept_search_result(page.begin_search_generation(), [video])
-    qtbot.waitUntil(lambda: page.results_model.thumbnail_at("thumb") is not None, timeout=2_000)
+    qtbot.waitUntil(lambda: page.results_model.thumbnail_at(video.site, video.id) is not None, timeout=2_000)
     assert page.results_model.data(page.results_model.index(0, 0), Qt.ItemDataRole.DecorationRole) is not None
 
     page.results_model.setData(page.results_model.index(0, 0), Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
@@ -244,6 +551,20 @@ def test_discover_displays_provider_warning_from_search_result(qtbot) -> None:
 
     assert page.results_model.video_at(0) is video
     assert "provider blocked" in page.error_label.text()
+
+
+def test_discover_success_clears_stale_errors_and_warning_replaces_them(qtbot) -> None:
+    page = DiscoverPage(StubSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    page.error_label.setText("stale error")
+    generation = page.begin_search_generation()
+
+    page.accept_search_result(generation, [])
+    assert "no video" in page.error_label.text().lower()
+
+    page.error_label.setText("another stale error")
+    page.accept_search_result(generation, {"results": [], "warning": "provider warning"})
+    assert page.error_label.text() == "provider warning"
 
 
 def test_download_actions_delegate_stop_and_retry(qtbot) -> None:
@@ -424,19 +745,36 @@ def test_library_supports_plex_to_local_and_refreshes_only_affected_panes(qtbot)
     assert plex.list_calls == 0
 
 
-def test_library_active_side_prefers_focus_over_stale_dual_selection(qtbot) -> None:
+def test_library_transfer_labels_follow_selected_direction(qtbot) -> None:
+    entry = StorageEntry(PurePosixPath("video.mp4"), 1)
+    page = LibraryPage(StubStorage("local"), StubStorage("plex"), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    page.set_entries("local", [entry])
+    page.set_entries("plex", [entry])
+
+    page.local_view.selectRow(0)
+    assert page.copy_button.text() == "Copy to Plex"
+    assert page.move_button.text() == "Move to Plex"
+
+    page.local_view.clearSelection()
+    page.plex_view.selectRow(0)
+    assert page.copy_button.text() == "Copy to Local"
+    assert page.move_button.text() == "Move to Local"
+
+
+def test_library_active_side_follows_the_selected_pane(qtbot) -> None:
     entry = StorageEntry(PurePosixPath("same.mp4"), 1)
     page = LibraryPage(StubStorage("local"), StubStorage("plex"), thread_pool=QThreadPool())
     qtbot.addWidget(page)
-    page.show()
     page.set_entries("local", [entry])
     page.set_entries("plex", [entry])
-    page.local_view.selectRow(0)
-    page.plex_view.selectRow(0)
-    page.local_view.setFocus()
-    qtbot.waitUntil(page.local_view.hasFocus)
 
+    page.local_view.selectRow(0)
     assert page._active_side() == "local"
+
+    page.local_view.clearSelection()
+    page.plex_view.selectRow(0)
+    assert page._active_side() == "plex"
 
 
 def test_library_plex_preview_rename_and_delete(qtbot) -> None:
@@ -648,6 +986,58 @@ def test_daemon_task_pool_has_fixed_concurrency_and_bounded_queue() -> None:
         raise AssertionError("bounded pool accepted work beyond max_pending")
     gate.set()
     assert pool.waitForDone(2_000)
+
+
+def test_diagnostics_reports_stale_ytdlp_warning() -> None:
+    warning = "yt-dlp 2025.01.01 is 42 days old; update it if downloads fail"
+    fake = SimpleNamespace(
+        resolve_ytdlp_command=lambda: (["yt-dlp"], None),
+        ytdlp_version_warning=lambda: warning,
+        ytdlp_version=lambda: "2025.01.01",
+    )
+
+    commands = gui_app._diagnostics(fake)
+
+    assert "yt-dlp freshness" in commands
+    assert warning in commands["yt-dlp freshness"]
+
+
+def test_diagnostics_reports_current_ytdlp_when_no_warning() -> None:
+    fake = SimpleNamespace(
+        resolve_ytdlp_command=lambda: (["yt-dlp"], None),
+        ytdlp_version_warning=lambda: None,
+        ytdlp_version=lambda: "2026.10.01",
+    )
+
+    commands = gui_app._diagnostics(fake)
+
+    freshness = commands["yt-dlp freshness"]
+    assert "2026.10.01" in freshness
+    assert "up to date" in freshness
+
+
+def test_diagnostics_survives_module_without_ytdlp_version_helpers() -> None:
+    fake = SimpleNamespace(resolve_ytdlp_command=lambda: (["yt-dlp"], None))
+
+    commands = gui_app._diagnostics(fake)
+
+    assert commands["yt-dlp"] == "yt-dlp"
+    assert "yt-dlp freshness" not in commands
+
+
+def test_diagnostics_survives_raising_ytdlp_warning() -> None:
+    def boom() -> str:
+        raise RuntimeError("boom")
+
+    fake = SimpleNamespace(
+        resolve_ytdlp_command=lambda: (["yt-dlp"], None),
+        ytdlp_version_warning=boom,
+    )
+
+    commands = gui_app._diagnostics(fake)
+
+    assert "yt-dlp freshness" in commands
+    assert "version check failed" in commands["yt-dlp freshness"]
 
 
 def test_production_composition_builds_callable_non_null_services(tmp_path) -> None:

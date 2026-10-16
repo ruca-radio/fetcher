@@ -22,6 +22,7 @@ class Task(QRunnable):
 
     def __init__(self, function: Callable[..., Any], *args: object, **kwargs: object) -> None:
         super().__init__()
+        self.setAutoDelete(False)
         self.function = function
         self.args = args
         self.kwargs = kwargs

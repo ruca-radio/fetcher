@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import threading
-import time
-from queue import Empty, Full, Queue
-
 from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -20,110 +16,7 @@ from .downloads import DownloadsPage
 from .library import LibraryPage
 from .player import MediaPlayerWidget
 from .settings import SettingsPage
-
-
-class DaemonTaskPool:
-    """Small Qt-compatible pool whose stuck tasks cannot block process exit."""
-
-    def __init__(self, *, max_workers: int = 4, max_pending: int = 128) -> None:
-        if max_workers < 1 or max_pending < max_workers:
-            raise ValueError("max_workers must be positive and max_pending must cover all workers")
-        self._condition = threading.Condition()
-        self._tasks: dict[int, object] = {}
-        self._queue: Queue[tuple[int, object]] = Queue(maxsize=max_pending)
-        self._running = 0
-        self._next_token = 0
-        self._closed = False
-        self._workers = tuple(
-            threading.Thread(target=self._worker, name=f"fetcher-gui-worker-{index + 1}", daemon=True)
-            for index in range(max_workers)
-        )
-        for worker in self._workers:
-            worker.start()
-
-    @property
-    def worker_count(self) -> int:
-        return len(self._workers)
-
-    def start(self, task) -> None:
-        with self._condition:
-            if self._closed:
-                raise RuntimeError("task pool is closed")
-            self._next_token += 1
-            token = self._next_token
-            self._tasks[token] = task
-        try:
-            self._queue.put_nowait((token, task))
-        except Full as exc:
-            with self._condition:
-                self._tasks.pop(token, None)
-                self._condition.notify_all()
-            raise RuntimeError("task pool queue is full") from exc
-
-    def _worker(self) -> None:
-        while True:
-            token, task = self._queue.get()
-            if task is None:
-                self._queue.task_done()
-                return
-            with self._condition:
-                if token not in self._tasks:
-                    self._queue.task_done()
-                    continue
-                self._running += 1
-            try:
-                task.run() if hasattr(task, "run") else task()
-            finally:
-                with self._condition:
-                    self._running -= 1
-                    self._tasks.pop(token, None)
-                    self._condition.notify_all()
-                self._queue.task_done()
-
-    def clear(self) -> None:
-        with self._condition:
-            tasks = tuple(self._tasks.values())
-        for task in tasks:
-            cancel = getattr(task, "cancel", None)
-            if cancel is not None:
-                cancel()
-        while True:
-            try:
-                token, _task = self._queue.get_nowait()
-            except Empty:
-                break
-            with self._condition:
-                self._tasks.pop(token, None)
-                self._condition.notify_all()
-            self._queue.task_done()
-
-    def shutdown(self, *, cancel_pending: bool = True) -> None:
-        with self._condition:
-            if self._closed:
-                return
-            self._closed = True
-        if cancel_pending:
-            self.clear()
-        for _worker in self._workers:
-            self._queue.put_nowait((0, None))
-
-    def waitForDone(self, milliseconds: int = -1) -> bool:
-        deadline = None if milliseconds < 0 else time.monotonic() + milliseconds / 1000
-        with self._condition:
-            while self._tasks:
-                remaining = None if deadline is None else deadline - time.monotonic()
-                if remaining is not None and remaining <= 0:
-                    return False
-                self._condition.wait(remaining)
-            return True
-
-    def activeThreadCount(self) -> int:
-        with self._condition:
-            return self._running
-
-    @staticmethod
-    def parent():
-        return None
+from .task_pool import DaemonTaskPool
 
 
 class MainWindow(QMainWindow):
@@ -139,9 +32,14 @@ class MainWindow(QMainWindow):
         self.download_manager = download_manager
         self.shutdown_grace_ms = max(0, shutdown_grace_ms)
         self._shutting_down = False
+        self._library_loaded = False
         self.player = player or MediaPlayerWidget(self)
-        self.discover_page = DiscoverPage(search_service, preview_service, download_manager,
-                                          thread_pool=self.thread_pool, parent=self)
+        persisted_settings = getattr(settings_service, "settings", None)
+        search_filters = getattr(persisted_settings, "search_filters", None)
+        self.discover_page = DiscoverPage(
+            search_service, preview_service, download_manager, search_filters=search_filters,
+            thread_pool=self.thread_pool, parent=self,
+        )
         self.downloads_page = DownloadsPage(download_manager, self, task_pool=self.thread_pool)
         self.library_page = LibraryPage(
             local_storage, plex_storage, confirm=confirm or self._confirm,
@@ -156,7 +54,7 @@ class MainWindow(QMainWindow):
         navigation = QVBoxLayout()
         for index, name in enumerate(("Discover", "Downloads", "Library", "Settings")):
             button = QPushButton(name, self)
-            button.clicked.connect(lambda _checked=False, index=index: self.workspace_stack.setCurrentIndex(index))
+            button.clicked.connect(lambda _checked=False, index=index: self._navigate(index))
             navigation.addWidget(button)
             self.navigation_buttons.append(button)
         navigation.addStretch(1)
@@ -170,7 +68,14 @@ class MainWindow(QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
         self.discover_page.preview_ready.connect(self.player.set_source)
+        self.discover_page.focused_result.connect(self.player.show_thumbnail)
         self.library_page.preview_ready.connect(self.player.set_source)
+
+    def _navigate(self, index: int) -> None:
+        self.workspace_stack.setCurrentIndex(index)
+        if index == 2 and not self._library_loaded:
+            self._library_loaded = True
+            self.library_page.refresh()
 
     def _confirm(self, message: str) -> bool:
         return QMessageBox.question(

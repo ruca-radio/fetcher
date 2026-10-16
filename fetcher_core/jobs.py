@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -188,6 +189,7 @@ class DownloadManager:
             raise ValueError("max_workers must be at least 1")
         self._downloader = downloader
         self._history = history_store
+        self._last_history_save = 0.0
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="fetcher-download")
         self._lock = threading.RLock()
         self._jobs: dict[str, DownloadJob] = {}
@@ -413,7 +415,7 @@ class DownloadManager:
                 if not self._is_current_locked(job, generation):
                     return
                 self._apply_terminal_request_locked(job, generation)
-                current_snapshot, current_subscribers = self._record_locked(job)
+                current_snapshot, current_subscribers = self._record_locked(job, progress_only=True)
             self._notify(current_snapshot, current_subscribers)
 
         def done(_: DownloadJob) -> None:
@@ -472,10 +474,13 @@ class DownloadManager:
         except KeyError as exc:
             raise KeyError(f"unknown job: {video_id}") from exc
 
-    def _record_locked(self, job: DownloadJob, *, strict: bool = False) -> tuple[JobSnapshot, tuple[Subscriber, ...]]:
-        if self._history:
+    def _record_locked(self, job: DownloadJob, *, strict: bool = False, progress_only: bool = False) -> tuple[JobSnapshot, tuple[Subscriber, ...]]:
+        # Keep live notifications frequent; checkpoint byte/progress changes at most
+        # once per second. Queue and terminal transitions are always durable.
+        if self._history and (not progress_only or time.monotonic() - self._last_history_save >= 1.0):
             try:
                 self._history.save(self._jobs.values())
+                self._last_history_save = time.monotonic()
             except Exception as exc:
                 if strict:
                     raise

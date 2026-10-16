@@ -33,6 +33,8 @@ cd fetcher
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# Optional: accelerated MP4 transfers (bundles aria2 for supported platforms)
+pip install '.[fast]'
 ```
 
 Make sure `yt-dlp` and `mpv` are available in your `PATH`.
@@ -44,10 +46,18 @@ git clone https://github.com/ruca-radio/fetcher.git
 cd fetcher
 python3 -m venv .venv
 source .venv/bin/activate
-pip install '.[gui]'
+pip install '.[gui,fast]'
 ```
 
 This installs the `fetcher` and `fetcher-gui` commands. To install only the TUI and CLI dependencies, use `pip install .`.
+
+With uv, use `uv sync --extra gui --extra fast` (add `--extra test` for development).
+
+HTTP/HTTPS video files use aria2 when installed, with up to 16 connections controlled by the concurrent fragments setting. HLS streams keep yt-dlp's native fragment downloader. Without aria2, downloads use yt-dlp's built-in downloader. Actual speed still depends on the media host and your connection.
+
+If PornHub, RedTube, or xHamster extraction fails, Fetcher can start a separate headless Chrome session and read the running player's stream data. This requires Chrome and Selenium; it does not use your normal Chrome profile. Site login, regional restrictions, and unavailable videos can still prevent extraction. The Downloads page shows the full failure message below the table and in the ETA tooltip.
+
+Completed media must meet `min_download_height` (720p by default). Missing search metadata stays unknown until the file is inspected. Files that fail final quality or preview checks are rejected once, without downloading them again through fallback backends.
 
 ## Quick Start
 
@@ -219,6 +229,14 @@ This directory includes:
 - `settings.json`
 - `downloaded_ids.txt`
 - `twitter_cookies.json`
+
+A few `settings.json` values are user-tunable:
+
+- `min_download_height` (default `720`) — rejects downloads below this height; it is also the first yt-dlp format selector, so raising it prefers higher-quality streams.
+- `eporner_preview_ratio` (default `0.6`) and `eporner_preview_min_seconds` (default `90`) — the Eporner blurred/teaser-preview guard: when a listing is at least `eporner_preview_min_seconds` long, a stream shorter than `eporner_preview_ratio` × the listed duration is rejected.
+- `search_filters.exclude_censored` (default `true`) — skips Eporner censored/mosaic uploads; also toggleable in the TUI search-filter screen.
+
+These can be edited directly in `settings.json`.
 
 After package installation, mutable state is stored under `$XDG_DATA_HOME/fetcher` (normally `~/.local/share/fetcher`) and caches and temporary files under `$XDG_CACHE_HOME/fetcher` (normally `~/.cache/fetcher`). Fetcher does not attempt to write into read-only site-packages directories.
 

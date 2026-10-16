@@ -5,11 +5,20 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fetcher_core.models import BASE_DIR, AppSettings, SearchFilters
+from fetcher_core.models import BASE_DIR, AppSettings, DownloadPolicy, SearchFilters
 from fetcher_core.settings import SettingsStore, parse_sftp_storage, prepare_runtime_settings
 
 
 class SettingsStoreTests(unittest.TestCase):
+    def test_new_policy_defaults_are_present(self) -> None:
+        settings = AppSettings()
+
+        self.assertTrue(settings.search_filters.exclude_censored)
+        self.assertEqual(settings.min_download_height, 720)
+        self.assertEqual(settings.eporner_preview_ratio, 0.6)
+        self.assertEqual(settings.eporner_preview_min_seconds, 90)
+        self.assertEqual(settings.download_policy(), DownloadPolicy(720, 0.6, 90))
+
     def test_loads_legacy_json_and_preserves_unknown_keys_on_save(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
@@ -27,6 +36,57 @@ class SettingsStoreTests(unittest.TestCase):
             self.assertEqual(loaded.settings.search_filters.pages, 4)
             self.assertEqual(loaded.unknown, {"future_key": {"enabled": True}})
             self.assertEqual(json.loads(path.read_text())["future_key"], {"enabled": True})
+
+    def test_download_policy_settings_round_trip_through_save_and_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            store = SettingsStore(path, defaults=AppSettings())
+            settings = AppSettings(
+                min_download_height=1080,
+                eporner_preview_ratio=0.75,
+                eporner_preview_min_seconds=120,
+                search_filters=SearchFilters(exclude_censored=False),
+            )
+
+            store.save(settings)
+            loaded = SettingsStore(path, defaults=AppSettings()).load().settings
+
+            self.assertEqual(loaded.min_download_height, 1080)
+            self.assertEqual(loaded.eporner_preview_ratio, 0.75)
+            self.assertEqual(loaded.eporner_preview_min_seconds, 120)
+            self.assertFalse(loaded.search_filters.exclude_censored)
+            self.assertEqual(loaded.download_policy(), DownloadPolicy(1080, 0.75, 120))
+
+    def test_download_policy_settings_are_clamped_on_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text(json.dumps({
+                "min_download_height": 9999,
+                "eporner_preview_ratio": 9.0,
+                "eporner_preview_min_seconds": -10,
+            }))
+
+            loaded = SettingsStore(path, defaults=AppSettings()).load().settings
+
+            self.assertEqual(loaded.min_download_height, 4320)
+            self.assertEqual(loaded.eporner_preview_ratio, 1.0)
+            self.assertEqual(loaded.eporner_preview_min_seconds, 0)
+
+    def test_download_policy_settings_garbage_falls_back_to_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            path.write_text(json.dumps({
+                "min_download_height": "bad",
+                "eporner_preview_ratio": "bad",
+                "eporner_preview_min_seconds": "bad",
+            }))
+
+            loaded = SettingsStore(path, defaults=AppSettings()).load().settings
+
+            self.assertEqual(loaded.min_download_height, 720)
+            self.assertEqual(loaded.eporner_preview_ratio, 0.6)
+            self.assertEqual(loaded.eporner_preview_min_seconds, 90)
+
 
     def test_corrupt_json_returns_defaults_and_reports_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,6 +146,22 @@ class SettingsStoreTests(unittest.TestCase):
             self.assertEqual(Path(destination), path)
             self.assertEqual(json.loads(path.read_text())["parallel_downloads"], 5)
             self.assertFalse(any(path.parent.glob("*.tmp")))
+
+    def test_save_all_persists_settings_and_gui_preferences_with_one_atomic_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.json"
+            store = SettingsStore(path, defaults=AppSettings())
+
+            with patch("fetcher_core.settings.os.replace", wraps=os.replace) as replace:
+                store.save_all(
+                    AppSettings(parallel_downloads=5),
+                    {"staging_dir": str(Path(tmp) / "staging"), "theme": "Dark"},
+                )
+
+            replace.assert_called_once()
+            payload = json.loads(path.read_text())
+            self.assertEqual(payload["parallel_downloads"], 5)
+            self.assertEqual(payload["gui"]["theme"], "Dark")
 
     def test_save_fsyncs_parent_directory_after_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

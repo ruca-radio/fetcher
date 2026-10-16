@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
 
-from PySide6.QtCore import QModelIndex, Qt
+from PySide6.QtCore import QModelIndex, QSize, Qt
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from fetcher_core.jobs import JobSnapshot
@@ -36,13 +37,99 @@ def test_search_results_model_supports_selection_and_display() -> None:
     assert model.selected_videos() == (sample_video(),)
 
 
+def test_search_results_model_accepts_raw_qt_check_state_integer() -> None:
+    model = SearchResultsModel()
+    video = sample_video()
+    model.set_results([video])
+
+    assert model.setData(model.index(0, 0), Qt.CheckState.Checked.value, Qt.ItemDataRole.CheckStateRole)
+    assert model.selected_videos() == (video,)
+
+
+def test_search_results_model_keys_selection_and_thumbnails_by_site_and_id() -> None:
+    app = QApplication.instance() or QApplication([])
+    model = SearchResultsModel()
+    eporner = sample_video("shared")
+    redtube = Video("shared", "RedTube", 1, 1, "https://redtube/shared", "RedTube")
+    model.set_results([eporner, redtube])
+    model.setData(model.index(0, 0), Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
+    eporner_thumbnail = QPixmap(160, 90)
+    eporner_thumbnail.fill(Qt.GlobalColor.red)
+    redtube_thumbnail = QPixmap(160, 90)
+    redtube_thumbnail.fill(Qt.GlobalColor.blue)
+
+    model.set_thumbnail("Eporner", "shared", eporner_thumbnail)
+    model.set_thumbnail("RedTube", "shared", redtube_thumbnail)
+
+    assert model.selected_videos() == (eporner,)
+    assert model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole).toImage().pixelColor(0, 0) == QColor(Qt.GlobalColor.red)
+    assert model.data(model.index(1, 0), Qt.ItemDataRole.DecorationRole).toImage().pixelColor(0, 0) == QColor(Qt.GlobalColor.blue)
+
+
+def test_search_results_model_scales_thumbnails_to_display_size() -> None:
+    app = QApplication.instance() or QApplication([])
+    model = SearchResultsModel()
+    video = sample_video()
+    model.set_results([video])
+    source = QPixmap(320, 180)
+    source.fill(Qt.GlobalColor.red)
+
+    model.set_thumbnail(video.site, video.id, source)
+
+    displayed = model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole)
+    assert displayed.size() == QSize(160, 90)
+    assert model.thumbnail_at(video.site, video.id).size() == QSize(320, 180)
+
+
+def test_search_results_model_prunes_thumbnails_removed_from_results() -> None:
+    app = QApplication.instance() or QApplication([])
+    model = SearchResultsModel()
+    video = sample_video()
+    model.set_results([video])
+    model.set_thumbnail(video.site, video.id, QPixmap(2, 2))
+
+    model.set_results([])
+
+    assert model.thumbnail_at(video.site, video.id) is None
+
+
 def test_download_model_replaces_immutable_snapshots() -> None:
     model = DownloadJobsModel()
     model.set_snapshots([snapshot()])
 
     assert model.rowCount() == 1
     assert model.snapshot_at(0).status == "downloading"
-    assert "37.5%" in model.data(model.index(0, 3), Qt.ItemDataRole.DisplayRole)
+    assert model.data(model.index(0, 3)) == "37.5%"
+    model.set_snapshots([snapshot("done")])
+    assert model.data(model.index(0, 2)) == "done"
+
+
+def test_download_failure_exposes_complete_error_in_tooltip():
+    from dataclasses import replace
+    model = DownloadJobsModel()
+    failure = replace(snapshot("failed"), message="Provider blocked extraction. " * 20)
+    model.set_snapshots([failure])
+    assert model.data(model.index(0, 5), Qt.ItemDataRole.ToolTipRole) == failure.message
+
+
+def test_progress_keeps_the_selected_download_row(qtbot):
+    from dataclasses import replace
+    page = DownloadsPage()
+    qtbot.addWidget(page)
+    page._accept_snapshot(snapshot())
+    page.view.selectRow(0)
+    page._accept_snapshot(replace(snapshot(), progress=55, revision=2))
+    assert page.view.currentIndex().row() == 0
+    assert page.view.selectionModel().selectedRows()[0].row() == 0
+
+
+def test_failed_download_shows_full_message_below_table(qtbot):
+    from dataclasses import replace
+    page = DownloadsPage()
+    qtbot.addWidget(page)
+    message = "Provider failed: browser stream is unavailable. " * 5
+    page._accept_snapshot(replace(snapshot("failed"), message=message))
+    assert message in page.details_label.text()
 
 
 def test_download_page_rejects_stale_revision() -> None:

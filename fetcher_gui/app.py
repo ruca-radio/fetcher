@@ -35,8 +35,18 @@ class SearchAdapter:
             hd_only=bool(values.get("hd_only", base.hd_only)),
             pages=int(values.get("pages", base.pages) or base.pages),
             exclude_phrases=str(values.get("exclude", base.exclude_phrases) or ""),
+            exclude_censored=bool(values.get("exclude_censored", base.exclude_censored)),
         )
-        return self.module.search_videos(query, provider, filters, twitter_count=40)
+        errors = getattr(self.module, "LAST_PROVIDER_ERRORS", None)
+        if isinstance(errors, dict):
+            errors.clear()
+        results = list(self.module.search_videos(query, provider, filters, twitter_count=40) or [])
+        warning_parts = []
+        if isinstance(errors, dict):
+            warning_parts.extend(f"{site}: {message}" for site, message in sorted(errors.items()) if message)
+        if not results:
+            warning_parts.append("No videos matched this search.")
+        return {"results": results, "warning": " ".join(warning_parts)}
 
 
 class PreviewAdapter:
@@ -81,6 +91,11 @@ class ProductionSettingsService:
     def save_gui_preferences(self, preferences: dict[str, object]) -> dict[str, object]:
         return self.store.save_gui_preferences(preferences)
 
+    def save_all(self, settings: AppSettings, preferences: dict[str, object]) -> dict[str, object]:
+        normalized = self.store.save_all(settings, preferences)
+        self.settings = self.store.validate(settings)
+        return normalized
+
     def validate(self, settings: AppSettings, preferences: dict[str, object]):
         validated = self.store.validate(settings)
         validate_preferences = getattr(self.store, "validate_gui_preferences", None)
@@ -115,9 +130,32 @@ class SettingsPageValidator:
 
 
 def _diagnostics(module) -> dict[str, str]:
-    commands = {name: shutil.which(name) or "not found" for name in ("ffmpeg", "ffprobe", "mpv", "sftp")}
+    commands = {name: shutil.which(name) or "not found" for name in ("ffmpeg", "ffprobe", "mpv", "sftp", "aria2c")}
+    if commands["aria2c"] == "not found":
+        sibling = Path(sys.executable).parent / ("aria2c.exe" if sys.platform == "win32" else "aria2c")
+        if sibling.is_file():
+            commands["aria2c"] = str(sibling)
     ytdlp, error = module.resolve_ytdlp_command()
     commands["yt-dlp"] = " ".join(ytdlp) if ytdlp else (error or "not found")
+    warning_fn = getattr(module, "ytdlp_version_warning", None)
+    if callable(warning_fn):
+        try:
+            freshness = warning_fn()
+        except Exception as exc:
+            freshness = f"yt-dlp version check failed: {exc}"
+        if freshness:
+            commands["yt-dlp freshness"] = str(freshness)
+        else:
+            version_fn = getattr(module, "ytdlp_version", None)
+            version = None
+            if callable(version_fn):
+                try:
+                    version = version_fn()
+                except Exception:
+                    version = None
+            commands["yt-dlp freshness"] = (
+                f"yt-dlp {version} is up to date" if version else "yt-dlp is up to date"
+            )
     return commands
 
 

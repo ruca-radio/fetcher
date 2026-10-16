@@ -42,6 +42,30 @@ def test_job_moves_from_queued_through_downloading_to_done_and_notifies() -> Non
     assert manager.get("one").worker_started is False
 
 
+def test_frequent_progress_does_not_fsync_history_for_every_update(tmp_path):
+    class CountingStore(JobHistoryStore):
+        saves = 0
+        def save(self, jobs):
+            self.saves += 1
+            super().save(jobs)
+
+    store = CountingStore(tmp_path / "jobs.json")
+
+    def transfer(job, progress, done):
+        for percent in range(100):
+            job.progress = percent
+            progress()
+        job.status = "done"
+        done(job)
+
+    manager = DownloadManager(transfer, history_store=store)
+    manager.submit(video())
+    manager.wait()
+    assert store.load()[0].status == "done"
+    assert store.saves < 10
+    manager.close()
+
+
 def test_duplicate_active_job_is_rejected() -> None:
     release = threading.Event()
     manager = DownloadManager(lambda job, progress, done: release.wait(2), max_workers=1)

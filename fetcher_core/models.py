@@ -38,6 +38,7 @@ class Video:
     quality_p: Optional[int] = None
     is_hd: Optional[bool] = None
     selected: bool = False
+    keywords: str = ""
 
     @property
     def duration_str(self) -> str:
@@ -76,6 +77,7 @@ class SearchFilters:
     hd_only: bool = False
     pages: int = 2
     exclude_phrases: str = DEFAULT_EXCLUDE_PHRASES
+    exclude_censored: bool = True
 
     @property
     def min_duration_s(self) -> int:
@@ -84,6 +86,13 @@ class SearchFilters:
     @property
     def max_duration_s(self) -> int:
         return (24 * 60 * 60) if self.max_duration_min <= 0 else self.max_duration_min * 60
+
+
+@dataclass
+class DownloadPolicy:
+    min_height: int = 720
+    preview_ratio: float = 0.6
+    preview_min_seconds: int = 90
 
 
 @dataclass
@@ -100,6 +109,9 @@ class AppSettings:
     naming_template: str = "%(title).180B [%(id)s].%(ext)s"
     organize_by_site: bool = False
     concurrent_fragments: int = 4
+    min_download_height: int = 720
+    eporner_preview_ratio: float = 0.6
+    eporner_preview_min_seconds: int = 90
     search_filters: SearchFilters = field(default_factory=SearchFilters)
 
     @property
@@ -109,6 +121,13 @@ class AppSettings:
     @property
     def tmp_path(self) -> Path:
         return Path(self.tmp_dir).expanduser()
+
+    def download_policy(self) -> DownloadPolicy:
+        return DownloadPolicy(
+            min_height=self.min_download_height,
+            preview_ratio=self.eporner_preview_ratio,
+            preview_min_seconds=self.eporner_preview_min_seconds,
+        )
 
 
 @dataclass

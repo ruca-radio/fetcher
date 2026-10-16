@@ -102,7 +102,8 @@ class SettingsPage(QWidget):
         form.addRow("Temporary directory", self.temp_edit)
         form.addRow("Local staging directory", self.staging_edit)
         form.addRow("Parallel downloads", self.parallel_spin)
-        form.addRow("Concurrent fragments", self.fragments_spin)
+        self.fragments_spin.setToolTip("HLS fragments or parallel HTTP connections with aria2 (maximum 16 HTTP connections).")
+        form.addRow("Connections / fragments", self.fragments_spin)
         form.addRow("Preview cache (MiB)", self.cache_size_spin)
         form.addRow("Preview cache age (days)", self.cache_age_spin)
         form.addRow("Theme", self.theme_combo)
@@ -146,13 +147,16 @@ class SettingsPage(QWidget):
                 settings, preferences = validate(settings, preferences)
             else:
                 self._validate_paths(settings, preferences)
-            self.settings_service.save(settings)
-            save_preferences = getattr(self.settings_service, "save_gui_preferences", None)
-            if save_preferences is not None:
-                preferences = save_preferences(preferences) or preferences
-                self._gui_preferences = preferences
+            save_all = getattr(self.settings_service, "save_all", None)
+            if save_all is not None:
+                preferences = save_all(settings, preferences) or preferences
             else:
-                raise RuntimeError("GUI preference persistence is unavailable")
+                self.settings_service.save(settings)
+                save_preferences = getattr(self.settings_service, "save_gui_preferences", None)
+                if save_preferences is None:
+                    raise RuntimeError("GUI preference persistence is unavailable")
+                preferences = save_preferences(preferences) or preferences
+            self._gui_preferences = preferences
         except Exception as exc:
             self.status_label.setText(f"Settings save failed: {exc}")
             return

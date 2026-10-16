@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from pathlib import PurePosixPath
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QThreadPool, Qt, Signal, Slot
+from PySide6.QtCore import QAbstractTableModel, QEvent, QModelIndex, QThreadPool, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
@@ -104,6 +104,15 @@ class LibraryPage(QWidget):
         self.rename_button.clicked.connect(self._prompt_rename)
         self.entries_ready.connect(self.set_entries)
         self.refresh_requested.connect(self.refresh_side)
+        self.local_view.selectionModel().selectionChanged.connect(self._update_transfer_labels)
+        self.plex_view.selectionModel().selectionChanged.connect(self._update_transfer_labels)
+        self.local_view.installEventFilter(self)
+        self.plex_view.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched in (self.local_view, self.plex_view) and event.type() == QEvent.Type.FocusIn:
+            self._update_transfer_labels()
+        return super().eventFilter(watched, event)
 
     def set_entries(self, side: str, entries: Iterable[StorageEntry]) -> None:
         (self.local_model if side == "local" else self.plex_model).set_entries(entries)
@@ -197,6 +206,12 @@ class LibraryPage(QWidget):
         source = self._active_side()
         target = "local" if source == "plex" else "plex"
         self.copy_selected(source, target, move=move)
+
+    @Slot()
+    def _update_transfer_labels(self) -> None:
+        target = "Local" if self._active_side() == "plex" else "Plex"
+        self.copy_button.setText(f"Copy to {target}")
+        self.move_button.setText(f"Move to {target}")
 
     def _selected(self, side: str) -> StorageEntry | None:
         view = self.local_view if side == "local" else self.plex_view

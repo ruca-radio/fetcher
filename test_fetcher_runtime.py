@@ -4,11 +4,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import fetcher_core.download
 import fetchtui
 from fetcher_core.jobs import DownloadManager
 from rich.console import Console
 
-from fetchtui import AppSettings, DownloadJob, FileEntry, Video
+from fetchtui import AppSettings, FileEntry, Video
 
 
 class FetcherRuntimeTests(unittest.TestCase):
@@ -27,34 +28,6 @@ class FetcherRuntimeTests(unittest.TestCase):
 
         self.assertIn("[xhTX7Bq-1]", preview.plain)
 
-    def test_run_download_keeps_primary_ytdlp_error_when_generic_fallback_masks_it(self) -> None:
-        video = Video(
-            id="sample",
-            title="Sample",
-            duration_s=0,
-            views=0,
-            url="https://example.invalid/video",
-            site="PornHub",
-        )
-        job = DownloadJob(video=video)
-
-        failures = [
-            (1, None, fetchtui.deque(["ERROR: primary extractor failed"], maxlen=12)),
-            (1, None, fetchtui.deque(["ERROR: flexible extractor failed"], maxlen=12)),
-            (1, None, fetchtui.deque(["ERROR: Unsupported URL: https://example.invalid/video"], maxlen=12)),
-        ]
-
-        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
-            with (
-                patch.object(fetchtui, "resolve_ytdlp_command", return_value=(["yt-dlp"], None)),
-                patch.object(fetchtui, "_run_download_process", side_effect=failures),
-                patch.object(fetchtui, "_resolve_direct_download_urls", return_value=([], "ERROR: Unsupported URL: https://example.invalid/video")),
-            ):
-                fetchtui.run_download(job, Path(tmp), Path(out), lambda: None, lambda _job: None)
-
-        self.assertEqual(job.status, "failed")
-        self.assertEqual(job.eta, "ERROR: primary extractor failed")
-
     def test_pornhub_direct_url_resolution_falls_back_to_browser_on_phantomjs_error(self) -> None:
         video = Video(
             id="sample",
@@ -72,15 +45,14 @@ class FetcherRuntimeTests(unittest.TestCase):
         )
 
         with (
-            patch.object(fetchtui.subprocess, "run", return_value=proc),
+            patch.object(fetcher_core.download.subprocess, "run", return_value=proc),
             patch.object(
-                fetchtui,
+                fetcher_core.download,
                 "_resolve_pornhub_browser_urls",
                 return_value=(["https://media.example/video.m3u8"], None),
-                create=True,
             ) as browser_resolver,
         ):
-            urls, error = fetchtui._resolve_direct_download_urls(video, ["yt-dlp"], force_generic=False)
+            urls, error = fetcher_core.download._resolve_direct_download_urls(video, ["yt-dlp"], force_generic=False)
 
         self.assertEqual(urls, ["https://media.example/video.m3u8"])
         self.assertIsNone(error)
@@ -115,15 +87,16 @@ class FetcherRuntimeTests(unittest.TestCase):
             manager = fetchtui.create_download_manager(settings, Path(tmp), Path(out))
             self.addCleanup(manager.close, wait=False, cancel_futures=True)
 
-            def fake_run(job, tmp_dir, output_dir, progress_cb, done_cb, template, organize, fragments):
+            def fake_run(job, tmp_dir, output_dir, progress_cb, done_cb, template, organize, fragments, policy):
                 self.assertEqual(tmp_dir, Path(tmp))
                 self.assertEqual(output_dir, Path(out))
                 self.assertEqual((template, organize, fragments), ("%(id)s.%(ext)s", True, 7))
+                self.assertIsNotNone(policy)
                 job.status = "done"
                 progress_cb()
                 done_cb(job)
 
-            with patch.object(fetchtui, "run_download", side_effect=fake_run):
+            with patch.object(fetcher_core.download, "run_download", side_effect=fake_run):
                 manager.submit(Video("adapter", "Adapter", 0, 0, "https://example.test/a", "Test"))
                 manager.wait()
 

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QUrl, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtMultimedia import QMediaPlayer
 
+from fetcher_core.models import Video
 from fetcher_gui.player import MediaPlayerWidget
 
 
@@ -105,6 +107,77 @@ def test_unseekable_source_disables_scrubber(qtbot) -> None:
     player.seekableChanged.emit(False)
 
     assert not widget.position_slider.isEnabled()
+
+
+def test_player_initially_shows_thumbnail_page(qtbot) -> None:
+    widget, _player, _audio = make_widget(qtbot)
+
+    assert widget.display_stack.currentWidget() is widget.thumbnail_label
+    assert widget.display_stack.currentWidget() is not widget.video_widget
+
+
+def test_show_thumbnail_hides_native_video_page(qtbot) -> None:
+    widget, player, _audio = make_widget(qtbot)
+    video = Video("one", "One", 1, 1, "https://one", "Eporner")
+    pixmap = QPixmap(160, 90)
+    widget.set_source("https://media.example/sample.m3u8")
+    player.playbackState = lambda: QMediaPlayer.PlaybackState.PlayingState
+
+    widget.show_thumbnail(video, pixmap)
+
+    assert widget.display_stack.currentWidget() is widget.thumbnail_label
+    assert widget.display_stack.currentWidget() is not widget.video_widget
+    assert player.stop_calls == 1
+    assert not widget.thumbnail_label.pixmap().isNull()
+
+
+def test_thumbnail_scales_to_label_after_first_show(qtbot) -> None:
+    widget, _player, _audio = make_widget(qtbot)
+    pixmap = QPixmap(320, 180)
+    pixmap.fill(Qt.GlobalColor.red)
+    widget.resize(900, 360)
+    widget.show_thumbnail(Video("one", "One", 1, 1, "https://one", "Eporner"), pixmap)
+
+    widget.show()
+    qtbot.waitExposed(widget)
+    qtbot.waitUntil(lambda: widget.thumbnail_label.size().width() >= 400, timeout=2_000)
+    shown = widget.thumbnail_label.pixmap()
+    label = widget.thumbnail_label.size()
+
+    assert shown.width() >= 400
+    assert shown.height() >= 200
+    assert shown.width() <= label.width()
+    assert shown.height() <= label.height()
+
+
+def test_thumbnail_label_rescales_when_player_grows(qtbot) -> None:
+    widget, _player, _audio = make_widget(qtbot)
+    pixmap = QPixmap(320, 180)
+    pixmap.fill(Qt.GlobalColor.red)
+    widget.resize(200, 120)
+    widget.show_thumbnail(Video("one", "One", 1, 1, "https://one", "Eporner"), pixmap)
+    widget.show()
+    qtbot.waitExposed(widget)
+
+    widget.resize(900, 360)
+    qtbot.waitUntil(lambda: widget.thumbnail_label.size().width() >= 400, timeout=2_000)
+    shown = widget.thumbnail_label.pixmap()
+    label = widget.thumbnail_label.size()
+
+    assert shown.width() >= 400
+    assert shown.height() >= 200
+    assert shown.width() <= label.width()
+    assert shown.height() <= label.height()
+    assert abs(shown.width() / shown.height() - 320 / 180) < 0.15
+
+
+def test_set_source_switches_to_video_page(qtbot) -> None:
+    widget, _player, _audio = make_widget(qtbot)
+    widget.show_thumbnail(Video("one", "One", 1, 1, "https://one", "Eporner"), QPixmap(160, 90))
+
+    widget.set_source("https://media.example/sample.m3u8")
+
+    assert widget.display_stack.currentWidget() is widget.video_widget
 
 
 def test_set_source_uses_local_file_url_and_remote_url(qtbot, tmp_path: Path) -> None:

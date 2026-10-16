@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QThreadPool, Qt, Signal, Slot, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QTableView, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QHeaderView, QLabel, QPushButton, QTableView, QVBoxLayout, QWidget
 
 from fetcher_core.jobs import JobSnapshot
 
@@ -27,9 +27,13 @@ class DownloadJobsModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.HEADERS)
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if role != Qt.ItemDataRole.DisplayRole or not index.isValid():
+        if not index.isValid():
             return None
         job = self._snapshots[index.row()]
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return job.message if index.column() == 5 else job.title
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
         return (
             job.title, job.site, job.status, f"{job.progress:.1f}%", job.speed,
             job.message, str(job.filepath) if job.filepath else "",
@@ -47,6 +51,17 @@ class DownloadJobsModel(QAbstractTableModel):
 
     def snapshot_at(self, row: int) -> JobSnapshot:
         return self._snapshots[row]
+
+    def update_snapshot(self, snapshot: JobSnapshot) -> None:
+        for row, current in enumerate(self._snapshots):
+            if current.id == snapshot.id:
+                self._snapshots[row] = snapshot
+                self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
+                return
+        row = len(self._snapshots)
+        self.beginInsertRows(QModelIndex(), row, row)
+        self._snapshots.append(snapshot)
+        self.endInsertRows()
 
     def clear_completed(self) -> None:
         self.set_snapshots(job for job in self._snapshots if job.status not in {"done", "failed", "cancelled", "interrupted"})
@@ -66,11 +81,18 @@ class DownloadsPage(QWidget):
         self.model = DownloadJobsModel(self)
         self.view = QTableView(self)
         self.view.setModel(self.model)
+        self.view.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.view.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.view.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.stop_button = QPushButton("Stop", self)
         self.retry_button = QPushButton("Retry", self)
         self.reveal_button = QPushButton("Reveal", self)
         self.clear_button = QPushButton("Clear completed", self)
         self.status_label = QLabel("", self)
+        self.details_label = QLabel("", self)
+        self.details_label.setWordWrap(True)
+        self.details_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.details_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._latest_revisions: dict[str, int] = {}
         self._cleared_revisions: dict[str, int] = {}
         controls = QHBoxLayout()
@@ -80,6 +102,8 @@ class DownloadsPage(QWidget):
         layout.addWidget(self.view, 1)
         layout.addLayout(controls)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.details_label)
+        self.view.selectionModel().currentRowChanged.connect(self._show_selected_job)
         self.snapshot_received.connect(self._accept_snapshot)
         self.operation_succeeded.connect(self._operation_succeeded)
         self.operation_failed.connect(self._operation_failed)
@@ -145,9 +169,20 @@ class DownloadsPage(QWidget):
         if snapshot.revision < self._latest_revisions.get(snapshot.id, 0):
             return
         self._latest_revisions[snapshot.id] = snapshot.revision
-        jobs = {job.id: job for job in self.model._snapshots}
-        jobs[snapshot.id] = snapshot
-        self.model.set_snapshots(jobs.values())
+        self.model.update_snapshot(snapshot)
+        row = self._current_row()
+        if row >= 0:
+            self._show_selected_job()
+        elif snapshot.status == "failed":
+            self.details_label.setText(f"{snapshot.site}: {snapshot.message}")
+
+    def _show_selected_job(self, *_args) -> None:
+        row = self._current_row()
+        if row < 0:
+            self.details_label.clear()
+            return
+        job = self.model.snapshot_at(row)
+        self.details_label.setText(f"{job.site}: {job.message}")
 
     def closeEvent(self, event) -> None:
         self.shutdown()

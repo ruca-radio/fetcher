@@ -10,6 +10,7 @@ Output: ./.fetcher/twitter_cookies.json
 import http.cookiejar
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,14 @@ if not YTDLP.exists():
 OUTPUT = STATE_DIR / "twitter_cookies.json"
 
 IMPORTANT = {"auth_token", "ct0", "twid", "guest_id"}
+
+
+def _write_private_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        json.dump(payload, out, indent=2)
+    os.chmod(path, 0o600)
 
 
 def resolve_ytdlp_command():
@@ -94,17 +103,14 @@ def extract() -> int:
     print(f"Found {len(cookies)} Twitter/X cookies:")
     for name in sorted(cookies.keys()):
         marker = " ★" if name in IMPORTANT else ""
-        val = cookies[name]
-        preview = val[:30] + "…" if len(val) > 30 else val
-        print(f"  {name}: {preview}{marker}")
+        print(f"  {name}{marker}")
 
     if "auth_token" not in cookies:
         print("\n⚠  auth_token missing — not logged in.")
         print("   Log in at https://x.com in Chrome, then re-run.")
         return 1
 
-    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT.write_text(json.dumps(cookies, indent=2))
+    _write_private_json(OUTPUT, cookies)
     print(f"\n✓ Saved {len(cookies)} cookies to {OUTPUT}")
     print("  Twitter search is now available in FetchTUI.")
     return 0
