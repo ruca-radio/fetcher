@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 import fetcher_core.providers as providers
+from fetcher_core import age_gate
 from fetcher_core.models import AppSettings, SearchFilters, Video
 from fetcher_core.providers import build_filters_from_args
 
@@ -222,6 +223,189 @@ def _pornhub_card(vid, title, *, thumb="", duration="2:00"):
     )
 
 
+def _pornhub_gate_page() -> str:
+    """The 18+ disclaimer interstitial: no results list, disclaimer markup only."""
+    return (
+        '<html><body class="logged-out">'
+        '<div id="ageDisclaimerMainBG">'
+        '<div class="js-ageDisclaimerModal">You must be 18 or older to enter.</div>'
+        '<a href="#" class="js-closeAgeModal">Enter</a>'
+        '</div></body></html>'
+    )
+
+
+def test_age_gate_exposes_site_cookie_values() -> None:
+    assert age_gate.PORNHUB_AGE_COOKIES == {
+        "accessAgeDisclaimerPH": "2",
+        "age_verified": "1",
+        "accessPH": "1",
+        "platform": "pc",
+    }
+    assert age_gate.PORNHUB_COOKIE_HEADER == (
+        "accessAgeDisclaimerPH=2; age_verified=1; accessPH=1"
+    )
+
+
+def test_apply_pornhub_age_cookies_sets_values_for_both_domains() -> None:
+    jar = httpx.Cookies()
+
+    age_gate.apply_pornhub_age_cookies(jar)
+
+    stored = {(cookie.domain, cookie.name): cookie.value for cookie in jar.jar}
+    for domain in ("pornhub.com", ".pornhub.com"):
+        for name, value in age_gate.PORNHUB_AGE_COOKIES.items():
+            assert stored[(domain, name)] == value
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.pornhub.com/age-verification",
+    "https://www.pornhub.com/age_verification",
+    "https://www.pornhub.com/verify-age",
+    "https://www.pornhub.com/agegate",
+    "https://www.pornhub.com/age-verification?redirect=%2Fvideo%2Fsearch",
+])
+def test_is_pornhub_age_gate_url_matches_gate_paths(url: str) -> None:
+    assert age_gate.is_pornhub_age_gate_url(url) is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.pornhub.com/video/search?search=needle&page=1",
+    "https://www.pornhub.com/view_video.php?viewkey=ph1",
+])
+def test_is_pornhub_age_gate_url_ignores_catalog_urls(url: str) -> None:
+    assert age_gate.is_pornhub_age_gate_url(url) is False
+
+
+@pytest.mark.parametrize("text", [
+    '<script>window.isSfwPage = true;</script>',
+    '<script>window.isSfwPage=true</script>',
+    '<script type="text/javascript">window.isSfwPage  =  true;</script>',
+    '<body class="sfw-page logged-out">',
+    '<body class="logged-out sfw-page">',
+])
+def test_is_pornhub_sfw_page_detects_restricted_catalog(text: str) -> None:
+    assert age_gate.is_pornhub_sfw_page(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    '<script>window.isSfwPage = false;</script>',
+    '<body class="logged-out">',
+    '<ul id="videoSearchResult"></ul>',
+    "",
+])
+def test_is_pornhub_sfw_page_ignores_full_catalog(text: str) -> None:
+    assert age_gate.is_pornhub_sfw_page(text) is False
+
+
+def test_is_pornhub_age_gate_page_detects_disclaimer_without_results() -> None:
+    assert age_gate.is_pornhub_age_gate_page(_pornhub_gate_page()) is True
+    assert age_gate.is_pornhub_age_gate_page(
+        '<div class="js-ageDisclaimerModal">18+</div>'
+    ) is True
+    # The real catalog also ships the disclaimer markup; the results list
+    # proves the page is not gated.
+    assert age_gate.is_pornhub_age_gate_page(
+        '<div class="js-ageDisclaimerModal">18+</div>'
+        '<ul id="videoSearchResult"><li class="videoblock"></li></ul>'
+    ) is False
+
+
+def test_is_pornhub_age_gate_page_ignores_sitewide_consent_and_no_results_pages() -> None:
+    # accessAgeDisclaimerPH appears in the cookie-consent config of every
+    # PornHub page, including a legitimate "no results" page.
+    consent = '{"pornhub.com":{"accessAgeDisclaimerPH":"essential","accessPH":"essential"}}'
+    assert age_gate.is_pornhub_age_gate_page(
+        consent + '<div id="noResultBigText">No Search Results.</div>'
+    ) is False
+
+
+def test_pornhub_age_gate_message_is_actionable() -> None:
+    message = age_gate.pornhub_age_gate_message()
+    lowered = message.lower()
+    assert "18+" in message
+    assert "age verification" in lowered
+    assert "restricted" in lowered
+    assert "sfw" in lowered
+    assert "may not unlock the full catalog" in lowered
+
+
+def test_pornhub_search_sends_age_verification_cookies(monkeypatch):
+    cookie_headers: list[str] = []
+    markup = '<ul id="videoSearchResult">' + _pornhub_card("phHit", "needle result") + '</ul>'
+
+    def respond(request):
+        cookie_headers.append(request.headers.get("cookie", ""))
+        return httpx.Response(200, text=markup)
+
+    monkeypatch.setattr(providers, "LAST_PROVIDER_ERRORS", {})
+    monkeypatch.setattr(
+        providers,
+        "build_client",
+        lambda **kwargs: httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+
+    rows = providers.search_pornhub("needle", 0, 9999, 1)
+
+    assert [row.id for row in rows] == ["phHit"]
+    assert cookie_headers, "the first search request must be sent with age cookies"
+    first = cookie_headers[0]
+    assert "accessAgeDisclaimerPH=2" in first
+    assert "age_verified=1" in first
+    assert "accessPH=1" in first
+
+
+def test_pornhub_age_gate_redirect_is_retried_once_with_cookies(monkeypatch):
+    search_requests: list[str] = []
+    markup = '<ul id="videoSearchResult">' + _pornhub_card("phHit", "needle result") + '</ul>'
+
+    def respond(request):
+        if request.url.path == "/age-verification":
+            return httpx.Response(200, text=_pornhub_gate_page())
+        if request.url.path == "/video/search":
+            search_requests.append(str(request.url))
+            if len(search_requests) == 1:
+                return httpx.Response(
+                    302, headers={"location": "https://www.pornhub.com/age-verification"}
+                )
+            return httpx.Response(200, text=markup)
+        return httpx.Response(503, text="API unavailable")
+
+    monkeypatch.setattr(providers, "LAST_PROVIDER_ERRORS", {})
+    monkeypatch.setattr(
+        providers,
+        "build_client",
+        lambda **kwargs: httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+
+    rows = providers.search_pornhub("needle", 0, 9999, 1)
+
+    assert [row.id for row in rows] == ["phHit"]
+    assert len(search_requests) == 2, "the gated search URL must be retried exactly once"
+    assert "PornHub" not in providers.LAST_PROVIDER_ERRORS
+
+
+def test_pornhub_persistent_age_gate_page_reports_error_without_rows(monkeypatch):
+    requested: list[str] = []
+
+    def respond(request):
+        requested.append(str(request.url))
+        return httpx.Response(200, text=_pornhub_gate_page())
+
+    monkeypatch.setattr(providers, "LAST_PROVIDER_ERRORS", {})
+    monkeypatch.setattr(
+        providers,
+        "build_client",
+        lambda **kwargs: httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+
+    assert providers.search_pornhub("needle", 0, 9999, 1) == []
+
+    assert len(requested) == 2, "the age-gated request must be retried exactly once"
+    message = providers.LAST_PROVIDER_ERRORS["PornHub"]
+    assert "18+" in message
+    assert "age verification" in message.lower()
+
+
 def test_pornhub_search_excludes_cards_outside_search_results(monkeypatch):
     markup = (
         '<aside>' + _pornhub_card("phAd", "Unrelated recommendation") + '</aside>'
@@ -249,7 +433,6 @@ def test_pornhub_search_keeps_metadata_with_its_own_card(monkeypatch):
 
 @pytest.mark.parametrize("redirect", [
     "https://www.pornhub.com/video",
-    "https://www.pornhub.com/age-verification",
     "https://www.pornhub.com/video/search?search=other&page=1",
     "https://www.pornhub.com/video/search?page=1",
     "https://example.invalid/video/search?search=needle&page=1",
@@ -260,14 +443,138 @@ def test_pornhub_search_rejects_responses_outside_requested_search(monkeypatch, 
     assert "search" in providers.LAST_PROVIDER_ERRORS["PornHub"]
 
 
+def test_pornhub_search_rejects_age_verification_redirect(monkeypatch):
+    markup = '<ul id="videoSearchResult">' + _pornhub_card("phWrong", "Unrelated upload") + '</ul>'
+    assert _pornhub_search(monkeypatch, markup, redirect="https://www.pornhub.com/age-verification") == []
+    assert "18+" in providers.LAST_PROVIDER_ERRORS["PornHub"]
+    assert "age verification" in providers.LAST_PROVIDER_ERRORS["PornHub"].lower()
+
+
 def test_pornhub_search_reports_missing_results_container(monkeypatch):
     assert _pornhub_search(monkeypatch, _pornhub_card("phWrong", "Generic upload")) == []
     assert "results" in providers.LAST_PROVIDER_ERRORS["PornHub"]
 
 
+@pytest.mark.parametrize("contents", [
+    '<ul id="videoSearchResult">' + _pornhub_card("phHit", "Needle result") + '</ul>',
+    '<div id="noResultBigText">No Search Results.</div>',
+])
+def test_pornhub_sfw_catalog_is_reported_as_age_gate_error_without_rows(monkeypatch, contents):
+    markup = '<script>window.isSfwPage = true;</script>' + contents
+
+    rows = _pornhub_search(monkeypatch, markup)
+
+    assert rows == [], "unrelated SFW catalog rows must never be presented as matches"
+    message = providers.LAST_PROVIDER_ERRORS["PornHub"]
+    assert "18+" in message
+    assert "SFW" in message
+    assert "restricted" in message
+    assert "age verification" in message.lower()
+    assert "PornHub" not in getattr(providers, "LAST_PROVIDER_WARNINGS", {})
+
+
+def test_pornhub_sfw_catalog_does_not_fall_back_to_legacy_api(monkeypatch):
+    requested: list[str] = []
+    markup = '<script>window.isSfwPage = true;</script>' + (
+        '<ul id="videoSearchResult">' + _pornhub_card("phHit", "Needle result") + '</ul>'
+    )
+
+    def respond(request):
+        requested.append(request.url.path)
+        return httpx.Response(200, text=markup)
+
+    monkeypatch.setattr(providers, "LAST_PROVIDER_ERRORS", {})
+    monkeypatch.setattr(
+        providers,
+        "build_client",
+        lambda **kwargs: httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+
+    assert providers.search_pornhub("needle", 0, 9999, 1) == []
+
+    assert requested == ["/video/search"]
+    assert "PornHub" in providers.LAST_PROVIDER_ERRORS
+
+
+def test_pornhub_full_catalog_search_clears_stale_restriction_diagnostics(monkeypatch):
+    markup = '<ul id="videoSearchResult">' + _pornhub_card("phHit", "Needle result") + '</ul>'
+    monkeypatch.setattr(
+        providers, "LAST_PROVIDER_ERRORS", {"PornHub": "stale age gate error"}
+    )
+    monkeypatch.setattr(
+        providers, "LAST_PROVIDER_WARNINGS", {"PornHub": "stale SFW restriction warning"}
+    )
+    monkeypatch.setattr(
+        providers,
+        "build_client",
+        lambda **kwargs: httpx.Client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, text=markup))
+        ),
+    )
+
+    rows = providers.search_pornhub("needle", 0, 9999, 1)
+
+    assert [row.id for row in rows] == ["phHit"]
+    assert "PornHub" not in providers.LAST_PROVIDER_ERRORS
+    assert "PornHub" not in providers.LAST_PROVIDER_WARNINGS
+
+
 def test_pornhub_empty_results_do_not_include_recommendations(monkeypatch):
     markup = '<ul id="videoSearchResult"></ul><aside>' + _pornhub_card("phOther", "Popular upload") + '</aside>'
     assert _pornhub_search(monkeypatch, markup) == []
+
+
+@pytest.mark.parametrize("status", [200, 404])
+def test_pornhub_explicit_no_matches_does_not_use_legacy_api(monkeypatch, status):
+    requested = []
+    markup = (
+        '<script>var consent = {"pornhub.com":{"accessAgeDisclaimerPH":"essential"}};</script>'
+        '<div class="noResultsWrapper"><div id="noResultBigText">No Search Results.</div></div>'
+        '<ul id="singleFeedSection">' + _pornhub_card("phOther", "Popular upload") + '</ul>'
+    )
+
+    def respond(request):
+        requested.append(request.url.path)
+        if request.url.path == "/webmasters/search":
+            return httpx.Response(200, json={"videos": [{
+                "video_id": "phWrong", "title": "Unrelated upload", "duration": "2:00",
+            }]})
+        return httpx.Response(status, text=markup)
+
+    monkeypatch.setattr(providers, "LAST_PROVIDER_ERRORS", {})
+    monkeypatch.setattr(providers, "build_client", lambda **kwargs: httpx.Client(transport=httpx.MockTransport(respond)))
+
+    assert providers.search_pornhub("needle", 0, 9999, 5) == []
+    assert requested == ["/video/search"]
+    assert "PornHub" not in providers.LAST_PROVIDER_ERRORS
+
+
+def test_pornhub_stops_pagination_at_explicit_no_matches(monkeypatch):
+    requested = []
+
+    def respond(request):
+        requested.append(str(request.url))
+        if request.url.params.get("page") == "1":
+            return httpx.Response(200, text='<ul id="videoSearchResult">' + _pornhub_card("phHit", "Needle result") + '</ul>')
+        return httpx.Response(404, text='<div id="noResultBigText">No Search Results.</div>')
+
+    monkeypatch.setattr(providers, "LAST_PROVIDER_ERRORS", {})
+    monkeypatch.setattr(providers, "build_client", lambda **kwargs: httpx.Client(transport=httpx.MockTransport(respond)))
+
+    assert [row.id for row in providers.search_pornhub("needle", 0, 9999, 20)] == ["phHit"]
+    assert len(requested) == 2
+    assert "PornHub" not in providers.LAST_PROVIDER_ERRORS
+
+
+@pytest.mark.parametrize("status,markup", [
+    (503, '<div id="noResultBigText">No Search Results.</div>'),
+    (200, '<script>var template = \'<div id="noResultBigText">No Search Results.</div>\';</script>'),
+])
+def test_pornhub_no_matches_marker_does_not_hide_invalid_responses(status, markup):
+    providers.LAST_PROVIDER_ERRORS.clear()
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(status, text=markup))) as client:
+        assert providers._search_pornhub_html(client, "needle", 0, 9999, 1) == []
+    assert "PornHub" in providers.LAST_PROVIDER_ERRORS
 
 
 def test_pornhub_search_reads_html_attributes_and_nested_card_content(monkeypatch):
@@ -317,3 +624,93 @@ def test_pornhub_search_keeps_duration_filters_and_deduplicates_pages(monkeypatc
     markup = '<ul id="videoSearchResult">' + _pornhub_card("phHit", "needle result") + '</ul>'
     assert [row.id for row in _pornhub_search(monkeypatch, markup, pages=2)] == ["phHit"]
     assert providers.search_pornhub("needle", 180, 9999, 1) == []
+
+
+@pytest.mark.parametrize("site,expected", [
+    ("PornHub", "https://www.pornhub.com/view_video.php?viewkey=ph123"),
+    ("xHamster", "https://xhamster.com/videos/xh123"),
+    ("RedTube", "https://www.redtube.com/123"),
+    ("Eporner", "https://www.eporner.com/video-abc123/"),
+])
+def test_normalize_download_target_expands_bare_ids(site, expected):
+    video_id, url = providers.normalize_download_target("ph123" if site == "PornHub" else ("xh123" if site == "xHamster" else ("123" if site == "RedTube" else "abc123")), site)
+    assert url == expected
+    assert video_id
+
+
+def test_normalize_download_target_passes_full_urls_through():
+    url = "https://spankbang.com/abc/video/example"
+    assert providers.normalize_download_target(url, "All Sites") == (url, url)
+
+
+def test_normalize_download_target_leaves_unknown_sites_untouched():
+    assert providers.normalize_download_target("bare-id", "All Sites") == ("bare-id", "bare-id")
+
+
+def test_search_twitter_records_missing_cookie_error(tmp_path):
+    providers.LAST_PROVIDER_ERRORS.pop("Twitter", None)
+    assert providers.search_twitter("cats", 5, tmp_path / "missing.json") == []
+    assert "cookie" in providers.LAST_PROVIDER_ERRORS["Twitter"].lower()
+
+
+def test_search_twitter_records_missing_auth_token(tmp_path):
+    import json
+
+    cookies = tmp_path / "cookies.json"
+    cookies.write_text(json.dumps({"ct0": "only-csrf"}))
+    providers.LAST_PROVIDER_ERRORS.pop("Twitter", None)
+    assert providers.search_twitter("cats", 5, cookies) == []
+    assert "auth_token" in providers.LAST_PROVIDER_ERRORS["Twitter"]
+
+
+def test_search_twitter_records_webdriver_failure(tmp_path, monkeypatch):
+    import json
+
+    import selenium.webdriver as webdriver
+
+    cookies = tmp_path / "cookies.json"
+    cookies.write_text(json.dumps({"auth_token": "token-value"}))
+
+    class _Boom:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("chrome is not installed")
+
+    monkeypatch.setattr(webdriver, "Chrome", _Boom)
+    providers.LAST_PROVIDER_ERRORS.pop("Twitter", None)
+    assert providers.search_twitter("cats", 5, cookies) == []
+    assert "RuntimeError" in providers.LAST_PROVIDER_ERRORS["Twitter"]
+
+
+def _hd_video(vid: str = "sx1") -> Video:
+    return Video(id=vid, title="Wider web result", duration_s=120, views=10, url="https://example.test/v", site="SpankBang", quality_p=1080, is_hd=True)
+
+
+def test_search_videos_searxng_disabled_records_error():
+    providers.LAST_PROVIDER_ERRORS.pop("SearXNG", None)
+    settings = AppSettings(searxng_enabled=False)
+    assert providers.search_videos("q", "SearXNG", SearchFilters(), settings=settings) == []
+    assert "SearXNG" in providers.LAST_PROVIDER_ERRORS
+
+
+def test_search_videos_searxng_uses_provider_when_enabled(monkeypatch):
+    monkeypatch.setattr(providers, "search_searxng", lambda query, settings, pages, limit=0: [_hd_video()])
+    settings = AppSettings(searxng_enabled=True)
+    rows = providers.search_videos("q", "SearXNG", SearchFilters(), settings=settings)
+    assert [row.id for row in rows] == ["sx1"]
+
+
+def test_search_videos_all_sites_includes_searxng_when_enabled(monkeypatch):
+    monkeypatch.setattr(providers, "SITE_FN", {})
+    monkeypatch.setattr(providers, "search_searxng", lambda query, settings, pages, limit=0: [_hd_video()])
+    settings = AppSettings(searxng_enabled=True)
+    assert [row.id for row in providers.search_videos("q", "All Sites", SearchFilters(), settings=settings)] == ["sx1"]
+
+
+def test_search_videos_all_sites_skips_searxng_when_disabled(monkeypatch):
+    def _fail(*args, **kwargs):
+        raise AssertionError("SearXNG must not run while disabled")
+
+    monkeypatch.setattr(providers, "SITE_FN", {})
+    monkeypatch.setattr(providers, "search_searxng", _fail)
+    settings = AppSettings(searxng_enabled=False)
+    assert providers.search_videos("q", "All Sites", SearchFilters(), settings=settings) == []

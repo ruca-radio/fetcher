@@ -336,6 +336,77 @@ def test_failed_job_can_be_retried() -> None:
     assert attempts == 2
 
 
+def test_retry_after_close_preserves_job_and_history(tmp_path: Path) -> None:
+    store = JobHistoryStore(tmp_path / "jobs.json")
+    manager = DownloadManager(lambda *_: None, history_store=store)
+    manager.submit(video())
+    manager.close()
+    previous = manager.get("one")
+    original_history = store.path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="download manager is closed"):
+        manager.retry("one")
+
+    assert manager.get("one") == previous
+    assert store.path.read_bytes() == original_history
+
+
+def test_clear_cancelled_job_allows_new_run_before_old_worker_exits() -> None:
+    old_started = threading.Event()
+    new_started = threading.Event()
+    release = threading.Event()
+
+    def downloader(job, progress, done):
+        if not old_started.is_set():
+            old_started.set()
+            release.wait(3)
+        else:
+            new_started.set()
+        job.status = "done"
+        done(job)
+
+    manager = DownloadManager(downloader, max_workers=2)
+    try:
+        manager.submit(video())
+        assert old_started.wait(1)
+        manager.stop("one")
+        assert manager.clear_completed() == 1
+        manager.submit(video())
+        assert new_started.wait(1), "old cancellation prevented the new download"
+    finally:
+        release.set()
+        manager.close()
+
+    assert manager.get("one").status == "done"
+    assert manager._futures == {}
+    assert manager._terminal_requests == {}
+
+
+def test_cancelling_queued_jobs_releases_run_bookkeeping() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def downloader(job, progress, done):
+        started.set()
+        release.wait(3)
+        job.status = "done"
+
+    manager = DownloadManager(downloader, max_workers=1)
+    try:
+        manager.submit(video("running"))
+        assert started.wait(1)
+        for number in range(10):
+            identifier = f"queued-{number}"
+            manager.submit(video(identifier))
+            assert manager.stop(identifier).status == "cancelled"
+    finally:
+        release.set()
+        manager.close()
+
+    assert manager._futures == {}
+    assert manager._terminal_requests == {}
+
+
 def test_executor_never_runs_more_than_configured_workers() -> None:
     lock = threading.Lock()
     release = threading.Event()

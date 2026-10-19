@@ -228,53 +228,51 @@ class DownloadManager:
             current = self._jobs.get(video.id)
             if current and current.status in ACTIVE_STATUSES:
                 raise DuplicateJobError(f"active job already exists for {video.id}")
-            previous = current
-            generation = self._generations.get(video.id, 0) + 1
-            job = DownloadJob(video=video)
-            self._jobs[video.id] = job
-            self._generations[video.id] = generation
-            try:
-                snapshot, subscribers = self._record_locked(job, strict=True)
-            except Exception:
-                if previous is None:
-                    self._jobs.pop(video.id, None)
-                    self._generations.pop(video.id, None)
-                else:
-                    self._jobs[video.id] = previous
-                    self._generations[video.id] = generation - 1
-                raise
-            start = threading.Event()
-            key = (video.id, generation)
-            future = self._executor.submit(self._run, job, generation, start)
-            self._futures[key] = future
-            future.add_done_callback(lambda completed, run_key=key: self._forget_run(run_key, completed))
+            snapshot, subscribers, start = self._enqueue_locked(video)
         self._notify(snapshot, subscribers)
         start.set()
         return snapshot
 
     def retry(self, video_id: str) -> JobSnapshot:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("download manager is closed")
             previous = self._require(video_id)
             if previous.status not in {"failed", "cancelled", "interrupted"}:
                 raise ValueError(f"job {video_id} cannot be retried from {previous.status}")
-            generation = self._generations.get(video_id, 0) + 1
-            job = DownloadJob(video=previous.video)
-            self._jobs[video_id] = job
-            self._generations[video_id] = generation
-            try:
-                snapshot, subscribers = self._record_locked(job, strict=True)
-            except Exception:
-                self._jobs[video_id] = previous
-                self._generations[video_id] = generation - 1
-                raise
-            start = threading.Event()
-            key = (video_id, generation)
-            future = self._executor.submit(self._run, job, generation, start)
-            self._futures[key] = future
-            future.add_done_callback(lambda completed, run_key=key: self._forget_run(run_key, completed))
+            snapshot, subscribers, start = self._enqueue_locked(previous.video)
         self._notify(snapshot, subscribers)
         start.set()
         return snapshot
+
+    def _enqueue_locked(
+        self, video: Video,
+    ) -> tuple[JobSnapshot, tuple[Subscriber, ...], threading.Event]:
+        """Persist and schedule a fresh run after the caller validates its state."""
+        previous = self._jobs.get(video.id)
+        previous_generation = self._generations.get(video.id)
+        generation = (previous_generation or 0) + 1
+        job = DownloadJob(video=video)
+        self._jobs[video.id] = job
+        self._generations[video.id] = generation
+        try:
+            snapshot, subscribers = self._record_locked(job, strict=True)
+        except Exception:
+            if previous is None:
+                self._jobs.pop(video.id, None)
+            else:
+                self._jobs[video.id] = previous
+            if previous_generation is None:
+                self._generations.pop(video.id, None)
+            else:
+                self._generations[video.id] = previous_generation
+            raise
+        start = threading.Event()
+        key = (video.id, generation)
+        future = self._executor.submit(self._run, job, generation, start)
+        self._futures[key] = future
+        future.add_done_callback(lambda completed, run_key=key: self._forget_run(run_key, completed))
+        return snapshot, subscribers, start
 
     def stop(self, video_id: str) -> JobSnapshot:
         with self._lock:
@@ -284,8 +282,10 @@ class DownloadManager:
             generation = self._generations[video_id]
             future = self._futures.get((video_id, generation))
             if future:
+                # cancel() invokes completion callbacks synchronously for queued
+                # work, so register the request before the callback removes it.
+                self._terminal_requests[(video_id, generation)] = "cancelled"
                 future.cancel()
-            self._terminal_requests[(video_id, generation)] = "cancelled"
             proc = job.proc
             was_paused = job.status == "paused"
             job.status = "cancelled"
@@ -328,9 +328,9 @@ class DownloadManager:
             }
             for video_id in removed:
                 self._jobs.pop(video_id, None)
-                self._generations.pop(video_id, None)
                 self._job_revisions.pop(video_id, None)
                 if not any(key[0] == video_id for key in self._futures):
+                    self._generations.pop(video_id, None)
                     for key in tuple(self._terminal_requests):
                         if key[0] == video_id:
                             self._terminal_requests.pop(key, None)
@@ -519,6 +519,9 @@ class DownloadManager:
             if self._futures.get(key) is future:
                 self._futures.pop(key, None)
             self._terminal_requests.pop(key, None)
+            video_id = key[0]
+            if video_id not in self._jobs and not any(run[0] == video_id for run in self._futures):
+                self._generations.pop(video_id, None)
 
     def _snapshot(self, job: DownloadJob) -> JobSnapshot:
         return JobSnapshot(

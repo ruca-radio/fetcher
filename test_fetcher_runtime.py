@@ -56,7 +56,7 @@ class FetcherRuntimeTests(unittest.TestCase):
 
         self.assertEqual(urls, ["https://media.example/video.m3u8"])
         self.assertIsNone(error)
-        browser_resolver.assert_called_once_with(video)
+        browser_resolver.assert_called_once_with(video, min_height=0)
 
     def test_download_manager_marks_worker_exceptions_failed(self) -> None:
         def explode(job, progress_cb, done_cb):

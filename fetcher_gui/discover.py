@@ -155,7 +155,7 @@ class DiscoverPage(QWidget):
         self.query_edit = QLineEdit(self)
         self.query_edit.setPlaceholderText("Search videos")
         self.provider_combo = QComboBox(self)
-        self.provider_combo.addItems(["All Sites", "PornHub", "xHamster", "RedTube", "Eporner", "Twitter"])
+        self.provider_combo.addItems(["All Sites", "PornHub", "xHamster", "RedTube", "Eporner", "SearXNG", "Twitter"])
         self.search_button = QPushButton("Search", self)
         self.min_duration_spin = QSpinBox(self)
         self.min_duration_spin.setRange(0, 1_440)

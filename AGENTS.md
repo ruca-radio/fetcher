@@ -2,7 +2,7 @@
 
 ## Repository Intent
 
-This repository contains the publishable source for `Fetcher v1.0`, a standalone Textual-based video search and download TUI.
+This repository contains the publishable source for `Fetcher v1.0`, a standalone Textual-based adult video search and download TUI.
 
 ## Guardrails
 

@@ -76,6 +76,10 @@ class SettingsPage(QWidget):
         self.parallel_spin = QSpinBox(self)
         self.parallel_spin.setRange(1, 16)
         self.parallel_spin.setValue(self._settings.parallel_downloads)
+        self.min_height_spin = QSpinBox(self)
+        self.min_height_spin.setRange(0, 4320)
+        self.min_height_spin.setValue(self._settings.min_download_height)
+        self.min_height_spin.setToolTip("Videos below this height are rejected; 0 disables the minimum-resolution check.")
         self.fragments_spin = QSpinBox(self)
         self.fragments_spin.setRange(1, 32)
         self.fragments_spin.setValue(self._settings.concurrent_fragments)
@@ -102,6 +106,7 @@ class SettingsPage(QWidget):
         form.addRow("Temporary directory", self.temp_edit)
         form.addRow("Local staging directory", self.staging_edit)
         form.addRow("Parallel downloads", self.parallel_spin)
+        form.addRow("Minimum download height (pixels, 0 = no minimum)", self.min_height_spin)
         self.fragments_spin.setToolTip("HLS fragments or parallel HTTP connections with aria2 (maximum 16 HTTP connections).")
         form.addRow("Connections / fragments", self.fragments_spin)
         form.addRow("Preview cache (MiB)", self.cache_size_spin)
@@ -128,6 +133,7 @@ class SettingsPage(QWidget):
             plex_dir=self.storage_edit.text().strip(),
             tmp_dir=self.temp_edit.text().strip(),
             parallel_downloads=self.parallel_spin.value(),
+            min_download_height=self.min_height_spin.value(),
             concurrent_fragments=self.fragments_spin.value(),
             naming_template=self.naming_edit.text(),
             searxng_enabled=self.searx_checkbox.isChecked(),

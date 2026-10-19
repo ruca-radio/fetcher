@@ -38,12 +38,15 @@ class SearchAdapter:
             exclude_censored=bool(values.get("exclude_censored", base.exclude_censored)),
         )
         errors = getattr(self.module, "LAST_PROVIDER_ERRORS", None)
-        if isinstance(errors, dict):
-            errors.clear()
-        results = list(self.module.search_videos(query, provider, filters, twitter_count=40) or [])
+        warnings = getattr(self.module, "LAST_PROVIDER_WARNINGS", None)
+        for diagnostics in (errors, warnings):
+            if isinstance(diagnostics, dict):
+                diagnostics.clear()
+        results = list(self.module.search_videos(query, provider, filters, twitter_count=40, settings=self.settings) or [])
         warning_parts = []
-        if isinstance(errors, dict):
-            warning_parts.extend(f"{site}: {message}" for site, message in sorted(errors.items()) if message)
+        for diagnostics in (errors, warnings):
+            if isinstance(diagnostics, dict):
+                warning_parts.extend(f"{site}: {message}" for site, message in sorted(diagnostics.items()) if message)
         if not results:
             warning_parts.append("No videos matched this search.")
         return {"results": results, "warning": " ".join(warning_parts)}

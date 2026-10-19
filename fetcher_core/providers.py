@@ -13,14 +13,22 @@ from typing import Optional
 from urllib.parse import parse_qs, quote_plus, urlparse
 from xml.etree.ElementTree import Element, SubElement
 
+from fetcher_core.age_gate import (
+    apply_pornhub_age_cookies,
+    is_pornhub_age_gate_page,
+    is_pornhub_age_gate_url,
+    is_pornhub_sfw_page,
+    pornhub_age_gate_message,
+)
 from fetcher_core.filters import dedupe_videos, video_matches_filters
 from fetcher_core.http import build_client
 from fetcher_core.models import AppSettings, STATE_DIR, SearchFilters, Video
 from fetcher_core.settings import normalize_min_quality
 
-SITES = ["All Sites", "PornHub", "xHamster", "RedTube", "Eporner"]
+SITES = ["All Sites", "PornHub", "xHamster", "RedTube", "Eporner", "SearXNG"]
 TWITTER_COOKIES = STATE_DIR / "twitter_cookies.json"
 LAST_PROVIDER_ERRORS: dict[str, str] = {}
+LAST_PROVIDER_WARNINGS: dict[str, str] = {}
 
 def _record_provider_error(site: str, message: str) -> None:
     LAST_PROVIDER_ERRORS[site] = message
@@ -171,7 +179,30 @@ def _solve_pornhub_key_challenge(text: str) -> Optional[str]:
     return f"{factor}*{p // factor}:{s}:{tail_match.group(1)}:{tail_match.group(2)}"
 
 
+def _apply_pornhub_age_cookies(client) -> None:
+    """Best-effort: accept PornHub's 18+ disclaimer on this client's cookie jar."""
+    try:
+        apply_pornhub_age_cookies(client.cookies)
+    except Exception:
+        # Test doubles/mappings may not expose an httpx-style cookie jar.
+        pass
+
+
+def _pornhub_is_gated_response(response) -> bool:
+    """True when the response is still behind the 18+ interstitial.
+
+    The restricted SFW catalog is *not* an age-gate page: it always renders the
+    disclaimer markup, yet its rows must be rejected differently (server-side
+    regional restriction cannot be unlocked by accepting the prompt).
+    """
+    text = getattr(response, "text", "") or ""
+    if is_pornhub_sfw_page(text):
+        return False
+    return is_pornhub_age_gate_url(str(getattr(response, "url", ""))) or is_pornhub_age_gate_page(text)
+
+
 def _pornhub_get(client, url: str):
+    _apply_pornhub_age_cookies(client)
     response = client.get(url, follow_redirects=True)
     key = _solve_pornhub_key_challenge(response.text)
     if key:
@@ -179,6 +210,19 @@ def _pornhub_get(client, url: str):
         client.cookies.set("KEY", key, domain=host, path="/")
         client.cookies.set("KEY", key, domain="pornhub.com", path="/")
         response = client.get(url, follow_redirects=True)
+    if _pornhub_is_gated_response(response):
+        # Perform the same 18+ acceptance the site's Enter control performs
+        # (accessAgeDisclaimerPH=2), then retry the originally requested URL
+        # exactly once.
+        _apply_pornhub_age_cookies(client)
+        try:
+            retried = client.get(url, follow_redirects=True)
+        except Exception:
+            _record_provider_error("PornHub", pornhub_age_gate_message())
+            return response
+        if _pornhub_is_gated_response(retried):
+            _record_provider_error("PornHub", pornhub_age_gate_message())
+        return retried
     return response
 
 
@@ -193,10 +237,17 @@ class _PornHubSearchParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.results: Optional[Element] = None
+        self.no_results = False
+        self.is_sfw = False
+        self._in_script = False
         self._stack: list[Element] = []
 
     def handle_starttag(self, tag, attrs) -> None:
         attributes = {key: value or "" for key, value in attrs}
+        if tag == "script":
+            self._in_script = True
+        if tag == "div" and attributes.get("id") == "noResultBigText":
+            self.no_results = True
         if self._stack:
             node = SubElement(self._stack[-1], tag, attributes)
         elif self.results is None and tag == "ul" and attributes.get("id") == "videoSearchResult":
@@ -207,6 +258,8 @@ class _PornHubSearchParser(HTMLParser):
             self._stack.append(node)
 
     def handle_endtag(self, tag) -> None:
+        if tag == "script":
+            self._in_script = False
         for index in range(len(self._stack) - 1, -1, -1):
             if self._stack[index].tag == tag:
                 del self._stack[index:]
@@ -217,6 +270,8 @@ class _PornHubSearchParser(HTMLParser):
         self.handle_endtag(tag)
 
     def handle_data(self, data) -> None:
+        if self._in_script and re.search(r"\bwindow\.isSfwPage\s*=\s*true\b", data):
+            self.is_sfw = True
         if not self._stack:
             return
         node = self._stack[-1]
@@ -229,6 +284,7 @@ class _PornHubSearchParser(HTMLParser):
 def _search_pornhub_html(client, query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
     out: list[Video] = []
     seen: set[str] = set()
+    gated = False
     for page in range(1, pages + 1):
         url = f"https://www.pornhub.com/video/search?search={quote_plus(query)}&page={page}"
         try:
@@ -236,9 +292,23 @@ def _search_pornhub_html(client, query: str, min_s: int, max_s: int, pages: int)
         except Exception as exc:
             _record_provider_error("PornHub", _format_provider_exception(exc))
             continue
+        if is_pornhub_sfw_page(response.text):
+            # Server-side regional restriction: PornHub serves unrelated
+            # "SFW US States" rows in place of real matches, and accepting the
+            # 18+ prompt cannot unlock the full catalog. Never surface those
+            # rows as search matches.
+            _record_provider_error("PornHub", pornhub_age_gate_message())
+            gated = True
+            break
+        if _pornhub_is_gated_response(response):
+            # _pornhub_get already accepted the 18+ prompt and retried once;
+            # the interstitial is still being served, so report it.
+            _record_provider_error("PornHub", pornhub_age_gate_message())
+            gated = True
+            break
         final_url = urlparse(str(response.url))
         if (
-            response.status_code >= 400
+            (response.status_code >= 400 and response.status_code != 404)
             or final_url.scheme != "https"
             or final_url.hostname not in {"www.pornhub.com", "pornhub.com"}
             or final_url.path.rstrip("/") != "/video/search"
@@ -253,10 +323,17 @@ def _search_pornhub_html(client, query: str, min_s: int, max_s: int, pages: int)
         parser = _PornHubSearchParser()
         parser.feed(response.text)
         parser.close()
+        if parser.no_results:
+            _clear_provider_error("PornHub")
+            break
+        if response.status_code == 404:
+            _record_provider_error("PornHub", "search returned HTTP 404 without a no-results page")
+            continue
         if parser.results is None:
             _record_provider_error("PornHub", "search results list missing; the page may be gated or its layout has changed")
             continue
         _clear_provider_error("PornHub")
+        LAST_PROVIDER_WARNINGS.pop("PornHub", None)
         for card in parser.results.findall("li"):
             if not (
                 card.get("data-video-vkey") or card.get("data-video-id")
@@ -299,7 +376,7 @@ def _search_pornhub_html(client, query: str, min_s: int, max_s: int, pages: int)
                     thumbnail.get("data-src"), thumbnail.get("src"),
                 ) if thumbnail is not None else None,
             ))
-    if out:
+    if out and not gated:
         _clear_provider_error("PornHub")
     return out
 
@@ -307,9 +384,15 @@ def _search_pornhub_html(client, query: str, min_s: int, max_s: int, pages: int)
 def search_pornhub(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
     out, seen = [], set()
     _clear_provider_error("PornHub")
+    LAST_PROVIDER_WARNINGS.pop("PornHub", None)
     with build_client(timeout=20) as c:
+        _apply_pornhub_age_cookies(c)
         html_results = _search_pornhub_html(c, query, min_s, max_s, pages)
         if html_results or "PornHub" not in LAST_PROVIDER_ERRORS:
+            return html_results
+        if LAST_PROVIDER_ERRORS.get("PornHub") == pornhub_age_gate_message():
+            # 18+ interstitial or server-side SFW restriction: the legacy
+            # webmasters API sits behind the same gate, so do not retry it.
             return html_results
         for page in range(1, pages + 1):
             url = f"https://www.pornhub.com/webmasters/search?search={quote_plus(query)}&page={page}"
@@ -600,15 +683,27 @@ SITE_FN = {
     "Eporner":  search_eporner,
 }
 
-def search_videos(query: str, site: str, filters: SearchFilters, twitter_count: int = 40) -> list[Video]:
+def _searxng_results(query: str, filters: SearchFilters, settings: Optional[AppSettings]) -> list[Video]:
+    if settings is None or not settings.searxng_enabled:
+        _record_provider_error("SearXNG", "SearXNG is disabled; enable it in settings to search the wider web")
+        return []
+    found = search_searxng(query, settings, filters.pages)
+    return [video for video in found if video_matches_filters(video, filters)]
+
+
+def search_videos(query: str, site: str, filters: SearchFilters, twitter_count: int = 40, settings: Optional[AppSettings] = None) -> list[Video]:
     if site == "Twitter":
         return dedupe_videos(search_twitter(query, twitter_count, TWITTER_COOKIES))
+    if site == "SearXNG":
+        return dedupe_videos(_searxng_results(query, filters, settings))
 
     sites = list(SITE_FN) if site == "All Sites" else [site]
     results: list[Video] = []
     for name in sites:
         found = _search_provider(name, query, filters.min_duration_s, filters.max_duration_s, filters.pages)
         results.extend(video for video in found if video_matches_filters(video, filters))
+    if site == "All Sites" and settings is not None and settings.searxng_enabled:
+        results.extend(_searxng_results(query, filters, settings))
     return dedupe_videos(results)
 
 
@@ -642,11 +737,20 @@ def build_filters_from_args(args: Namespace, settings: AppSettings) -> SearchFil
     )
 
 
+_BARE_ID_TEMPLATES = {
+    "PornHub": "https://www.pornhub.com/view_video.php?viewkey={id}",
+    "xHamster": "https://xhamster.com/videos/{id}",
+    "RedTube": "https://www.redtube.com/{id}",
+    "Eporner": "https://www.eporner.com/video-{id}/",
+}
+
+
 def normalize_download_target(target: str, site: str) -> tuple[str, str]:
     if re.match(r"^https?://", target):
         return target, target
-    if site == "PornHub":
-        return target, f"https://www.pornhub.com/view_video.php?viewkey={target}"
+    template = _BARE_ID_TEMPLATES.get(site)
+    if template:
+        return target, template.format(id=target)
     return target, target
 
 
@@ -669,17 +773,28 @@ def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
 
+    _clear_provider_error("Twitter")
+
     # Load auth_token from cookies file
     if cookies_file.exists():
         try:
             cdata = json.loads(cookies_file.read_text())
             auth_token = cdata.get("auth_token", "")
-        except Exception:
-            auth_token = ""
+        except Exception as exc:
+            _record_provider_error("Twitter", f"unreadable Twitter cookie file: {exc}")
+            return []
     else:
+        _record_provider_error(
+            "Twitter",
+            "no Twitter cookies; run extract_twitter_cookies.py or log in through the TUI",
+        )
         return []
 
     if not auth_token:
+        _record_provider_error(
+            "Twitter",
+            "stored Twitter cookies have no auth_token; re-authenticate",
+        )
         return []
 
     opts = Options()
@@ -689,11 +804,12 @@ def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
     opts.add_argument("--disable-gpu")
     opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
-    driver = webdriver.Chrome(options=opts)
+    driver = None
     out: list[Video] = []
     seen: set[str] = set()
 
     try:
+        driver = webdriver.Chrome(options=opts)
         # Set auth cookie
         driver.get("https://x.com")
         _time.sleep(2)
@@ -804,9 +920,18 @@ def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
                         site="Twitter",
                         thumbnail_url=thumb_url,
                     ))
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_provider_error("Twitter", _format_provider_exception(exc))
     finally:
-        driver.quit()
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    if out:
+        _clear_provider_error("Twitter")
+    elif "Twitter" not in LAST_PROVIDER_ERRORS:
+        _record_provider_error("Twitter", "no media results captured; Chrome may be missing or the query returned nothing")
 
     return out

@@ -104,6 +104,7 @@ from fetcher_core.models import (
 )
 from fetcher_core.providers import (
     LAST_PROVIDER_ERRORS,
+    LAST_PROVIDER_WARNINGS,
     SITES,
     SITE_FN,
     TWITTER_COOKIES,
@@ -953,6 +954,9 @@ class FetchTUI(App):
                         with Horizontal(classes="settings-row"):
                             yield Label("Parallel Downloads")
                             yield Input(id="settings-parallel", type="integer")
+                        with Horizontal(classes="settings-row"):
+                            yield Label("Minimum Download Height (0 = no minimum)")
+                            yield Input(id="settings-min-height", type="integer")
                     with Horizontal(id="settings-actions"):
                         yield Button("Save Settings", variant="primary", id="btn-settings-save")
                         yield Button("Reload Settings", variant="default", id="btn-settings-reload")
@@ -1004,6 +1008,7 @@ class FetchTUI(App):
         self.query_one("#settings-plex-dir", Input).value = self.settings.plex_dir
         self.query_one("#settings-tmp-dir", Input).value = self.settings.tmp_dir
         self.query_one("#settings-parallel", Input).value = str(self.settings.parallel_downloads)
+        self.query_one("#settings-min-height", Input).value = str(self.settings.min_download_height)
         self._set_settings_status("")
 
     def _filter_summary_text(self) -> str:
@@ -1403,11 +1408,24 @@ class FetchTUI(App):
         results: list[Video] = []
         targets = list(SITE_FN.keys()) if site == "All Sites" else [site]
         for s in targets:
-            found = _search_provider(s, query, min_s, max_s, pages)
+            if s == "SearXNG":
+                if not self.settings.searxng_enabled:
+                    self.call_from_thread(self._log, "  SearXNG: disabled in settings")
+                    continue
+                found = search_searxng(query, self.settings, pages)
+            else:
+                found = _search_provider(s, query, min_s, max_s, pages)
             results.extend(found)
             self.call_from_thread(self._log, f"  {s}: {len(found)} results")
             if not found and s in LAST_PROVIDER_ERRORS:
                 self.call_from_thread(self._log, f"  {s}: {LAST_PROVIDER_ERRORS[s]}")
+            if s in LAST_PROVIDER_WARNINGS:
+                self.call_from_thread(self._log, f"  {s}: {LAST_PROVIDER_WARNINGS[s]}")
+
+        if site == "All Sites" and self.settings.searxng_enabled:
+            extra = search_searxng(query, self.settings, pages)
+            results.extend(extra)
+            self.call_from_thread(self._log, f"  SearXNG: {len(extra)} results")
 
         results = [video for video in results if self._video_matches_search_filters(video)]
         seen_ids: set[str] = set()
@@ -1746,6 +1764,12 @@ class FetchTUI(App):
         except ValueError:
             self._set_settings_status("Parallel downloads must be a number.")
             return
+        try:
+            min_height = int(self.query_one("#settings-min-height", Input).value or "720")
+        except ValueError:
+            self._set_settings_status("Minimum download height must be a number.")
+            return
+        min_height = max(0, min(4320, min_height))
         if not plex_dir_raw or not tmp_dir_raw:
             self._set_settings_status("Download and temporary directories are required.")
             return
@@ -1757,6 +1781,7 @@ class FetchTUI(App):
             plex_dir=plex_dir_raw,
             tmp_dir=tmp_dir_raw,
             parallel_downloads=parallel,
+            min_download_height=min_height,
             searxng_url=self.settings.searxng_url,
             searxng_enabled=self.settings.searxng_enabled,
             searxng_categories=self.settings.searxng_categories,
@@ -1844,7 +1869,10 @@ class FetchTUI(App):
             else:
                 self.call_from_thread(self._schedule_remove_failed, finished)
 
-        run_download(job, self._tmp_dir, self._plex_dir, progress_cb, done_cb)
+        run_download(
+            job, self._tmp_dir, self._plex_dir, progress_cb, done_cb,
+            policy=self.settings.download_policy(),
+        )
 
     # ── Retry handler ─────────────────────────────────────────────────────────
     def on_job_row_retry_requested(self, event: JobRow.RetryRequested) -> None:
@@ -2026,14 +2054,22 @@ def build_parser() -> ArgumentParser:
     return parser
 
 
-def cli_search(args: Namespace, settings: AppSettings) -> int:
+def _cli_search_results(args: Namespace, settings: AppSettings) -> list[Video]:
+    """Search once and expose provider diagnostics for both CLI workflows."""
     LAST_PROVIDER_ERRORS.clear()
+    LAST_PROVIDER_WARNINGS.clear()
     filters = build_filters_from_args(args, settings)
-    results = search_videos(args.query, args.site, filters, twitter_count=args.count)
+    results = search_videos(args.query, args.site, filters, twitter_count=args.count, settings=settings)
     results.sort(key=lambda video: video.views, reverse=True)
-    for site, error in sorted(LAST_PROVIDER_ERRORS.items()):
-        if args.site in ("All Sites", site):
-            print(f"Warning: {site}: {error}", file=sys.stderr)
+    for diagnostics in (LAST_PROVIDER_ERRORS, LAST_PROVIDER_WARNINGS):
+        for site, message in sorted(diagnostics.items()):
+            if args.site in ("All Sites", site):
+                print(f"Warning: {site}: {message}", file=sys.stderr)
+    return results
+
+
+def cli_search(args: Namespace, settings: AppSettings) -> int:
+    results = _cli_search_results(args, settings)
     if args.json:
         print(json.dumps([video_to_dict(video) for video in (results[:args.limit] if args.limit else results)], indent=2))
     else:
@@ -2062,7 +2098,7 @@ def cli_download(args: Namespace, settings: AppSettings) -> int:
     for target in args.targets:
         video = build_download_video(target, args.site)
         print(f"Downloading [{video.site}] {video.url}")
-        job = download_one(video, tmp_dir, output_dir)
+        job = download_one(video, tmp_dir, output_dir, settings.download_policy())
         if job.status == "done":
             print(f"Saved to {job.filepath}")
         else:
@@ -2072,9 +2108,7 @@ def cli_download(args: Namespace, settings: AppSettings) -> int:
 
 
 def cli_batch(args: Namespace, settings: AppSettings) -> int:
-    filters = build_filters_from_args(args, settings)
-    results = search_videos(args.query, args.site, filters, twitter_count=args.count)
-    results.sort(key=lambda video: video.views, reverse=True)
+    results = _cli_search_results(args, settings)
     selected = results[: max(0, args.limit)]
     if not selected:
         print("No results selected for download.", file=sys.stderr)
@@ -2095,7 +2129,10 @@ def cli_batch(args: Namespace, settings: AppSettings) -> int:
     for warning in warnings:
         print(f"Warning: {warning}", file=sys.stderr)
 
-    jobs = run_batch_download(selected, tmp_dir, output_dir, parallel=max(1, args.parallel))
+    jobs = run_batch_download(
+        selected, tmp_dir, output_dir, parallel=max(1, args.parallel),
+        policy=settings.download_policy(),
+    )
 
     failures = [job for job in jobs if job.status != "done"]
     for job in jobs:

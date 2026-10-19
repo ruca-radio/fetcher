@@ -13,7 +13,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
+from fetcher_core.age_gate import (
+    PORNHUB_COOKIE_HEADER,
+    age_wall_message,
+    age_wall_region,
+    is_age_wall_page,
+    is_pornhub_age_gate_page,
+    is_pornhub_sfw_page,
+    pornhub_age_gate_message,
+)
 from fetcher_core.filters import is_known_censored_media_url
 from fetcher_core.jobs import DownloadManager, JobHistoryStore, terminate_process_group
 from fetcher_core.models import AppSettings, BASE_DIR, DownloadJob, DownloadPolicy, STATE_DIR, Video
@@ -36,6 +46,15 @@ HEADERS = {
 MIN_DOWNLOAD_HEIGHT = 720
 YTDLP_FORMAT = f"bestvideo[height>={MIN_DOWNLOAD_HEIGHT}]+bestaudio/best[height>={MIN_DOWNLOAD_HEIGHT}]"
 YTDLP_FLEX_FORMAT = "bestvideo+bestaudio/best"
+
+# Browser impersonation (borrowed from the sibling Porn_Fetch project): yt-dlp
+# can impersonate Chrome's TLS fingerprint, which unblocks many tube sites.
+_CURL_CFFI_AVAILABLE = importlib.util.find_spec("curl_cffi") is not None
+
+
+def _impersonation_args() -> list[str]:
+    """yt-dlp --impersonate args, but only when curl_cffi is importable."""
+    return ["--impersonate", "chrome"] if _CURL_CFFI_AVAILABLE else []
 
 
 def _ytdlp_format(min_height: int) -> str:
@@ -92,6 +111,8 @@ def ytdlp_version_warning() -> Optional[str]:
 
 def _job_temp_dir(tmp_dir: Path, video: Video) -> Path:
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", video.id or video.title).strip("-") or "job"
+    if slug in {".", ".."}:
+        slug = "job"
     return tmp_dir / slug[:80]
 
 
@@ -126,9 +147,42 @@ def cleanup_tmp(tmp_dir: Path, plex_dir: Path) -> tuple[int, int]:
     return moved, deleted
 
 
+TWITTER_COOKIES_JSON = STATE_DIR / "twitter_cookies.json"
+TWITTER_COOKIES_NETSCAPE = STATE_DIR / "twitter_cookies.net.txt"
+_FAR_FUTURE_EXPIRY = 2147483647
+
+
+def _twitter_cookie_args() -> list[str]:
+    """Use the stored Twitter cookie file when available, else Chrome's jar.
+
+    Importing TWITTER_COOKIES from fetcher_core.providers would work (providers
+    does not import this module) but drags the HTTP stack in, so derive the
+    path from STATE_DIR directly.
+    """
+    try:
+        data = json.loads(TWITTER_COOKIES_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ["--cookies-from-browser", "chrome"]
+    if not isinstance(data, dict) or not str(data.get("auth_token") or "").strip():
+        return ["--cookies-from-browser", "chrome"]
+    lines = ["# Netscape HTTP Cookie File", "# https://curl.se/docs/http-cookies.html"]
+    for name, value in data.items():
+        token = value if isinstance(value, str) else ""
+        if not name or not token:
+            continue
+        lines.append(f".x.com\tTRUE\t/\tTRUE\t{_FAR_FUTURE_EXPIRY}\t{name}\t{token}")
+    try:
+        TWITTER_COOKIES_NETSCAPE.parent.mkdir(parents=True, exist_ok=True)
+        TWITTER_COOKIES_NETSCAPE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        logger.warning("failed to write Twitter cookie file", exc_info=True)
+        return ["--cookies-from-browser", "chrome"]
+    return ["--cookies", str(TWITTER_COOKIES_NETSCAPE)]
+
+
 def _site_ytdlp_args(video: Video) -> list[str]:
     if video.site == "Twitter":
-        return ["--cookies-from-browser", "chrome"]
+        return _twitter_cookie_args()
     return []
 
 
@@ -210,69 +264,173 @@ def _probe_video_duration(path: Path) -> Optional[float]:
         return None
 
 
-def _run_download_process(job: DownloadJob, cmd: list[str], progress_cb, *, expected_dest: Optional[Path] = None) -> tuple[int, Optional[Path], deque[str]]:
+def _probe_remote_media_height(url: str, video: Video) -> Optional[int]:
+    """Inspect a resolved media URL's height without transferring the whole file.
+
+    The direct/resolved URLs can lack quality metadata (for example a bare HLS
+    master URL), so the floor is checked against the stream itself before a
+    fallback transfer starts. An uninspectable URL returns None and the final
+    local ffprobe check still applies.
+    """
+    if not FFPROBE or not url or not url.startswith(("http://", "https://")):
+        return None
+    cmd = [
+        FFPROBE, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=height", "-of", "json",
+        "-user_agent", HEADERS["User-Agent"],
+        "-referer", _provider_download_url(video),
+        "-probesize", "5000000", "-analyzeduration", "5000000",
+    ]
+    if _is_pornhub_download(video):
+        cmd.extend(["-cookies", PORNHUB_COOKIE_HEADER])
+    cmd.append(url)
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False, timeout=20,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        streams = json.loads(proc.stdout or "{}").get("streams", [])
+        height = streams[0].get("height") if streams else None
+        return int(height) if height else None
+    except Exception:
+        return None
+
+
+def _resolved_stream_below_floor(url: str, video: Video, min_height: int) -> Optional[str]:
+    """Return a failure message when a resolved stream is known to be too short."""
+    if min_height <= 0:
+        return None
+    height = _probe_remote_media_height(url, video)
+    if height is None or height >= min_height:
+        return None
+    return f"resolved stream is {height}p; Fetcher requires {min_height}p+"
+
+
+def _download_patterns() -> dict[str, re.Pattern[str]]:
+    return {
+        "percent": re.compile(r"\[download\].*?([\d.]+)%"),
+        "speed": re.compile(r"\bat\s+([\d.]+\s*[^\s]+)"),
+        "eta": re.compile(r"\bETA\s+(\S+)"),
+        "done": re.compile(r"\[download\]\s+100(?:\.0+)?%\s+of"),
+        "destination": re.compile(r"\[download\] Destination: (.+)"),
+        "merge": re.compile(r'\[Merger\] Merging formats into "(.+)"'),
+        "printed": re.compile(r"__FETCHER_DEST__:(.+)"),
+        "ffmpeg_time": re.compile(r"time=(\S+)"),
+        "aria": re.compile(
+            r"\[#[^\s]+\s+[^\s]+\((\d+)%\).*?\bDL:([^\s\]]+)"
+            r"(?:\s+ETA:([^\s\]]+))?"
+        ),
+    }
+
+
+def _handle_download_line(
+    job: DownloadJob,
+    line: str,
+    dest: Optional[Path],
+    progress_dir: Optional[Path],
+    progress_cb,
+    patterns: dict[str, re.Pattern[str]],
+) -> Optional[Path]:
+    if match := patterns["aria"].search(line):
+        job.progress = float(match.group(1))
+        job.speed = match.group(2) + "/s"
+        job.eta = match.group(3) or ""
+        if progress_dir:
+            job.downloaded_bytes = _job_temp_bytes(progress_dir)
+        progress_cb()
+    elif patterns["done"].search(line):
+        job.progress = 100.0
+        job.speed = ""
+        job.eta = ""
+        if progress_dir:
+            job.downloaded_bytes = _job_temp_bytes(progress_dir)
+        progress_cb()
+    elif match := patterns["percent"].search(line):
+        job.progress = float(match.group(1))
+        if speed := patterns["speed"].search(line):
+            job.speed = speed.group(1)
+        if eta := patterns["eta"].search(line):
+            job.eta = eta.group(1)
+        if progress_dir:
+            job.downloaded_bytes = _job_temp_bytes(progress_dir)
+        progress_cb()
+    elif match := patterns["destination"].search(line):
+        dest = Path(match.group(1).strip())
+    elif match := patterns["merge"].search(line):
+        dest = Path(match.group(1).strip().strip('"'))
+    elif match := patterns["printed"].search(line):
+        dest = Path(match.group(1).strip())
+    elif match := patterns["ffmpeg_time"].search(line):
+        job.eta = f"ffmpeg {match.group(1)}"
+        if progress_dir:
+            job.downloaded_bytes = _job_temp_bytes(progress_dir)
+        progress_cb()
+    return dest
+
+
+def _run_download_process(
+    job: DownloadJob,
+    cmd: list[str],
+    progress_cb,
+    *,
+    expected_dest: Optional[Path] = None,
+) -> tuple[int, Optional[Path], deque[str]]:
     if job.status in {"cancelled", "interrupted"}:
         return -15, None, deque([job.status], maxlen=12)
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
     except OSError as exc:
         return 1, None, deque([str(exc)], maxlen=12)
+
     job.proc = proc
-    progress_cb()
-    if job.status in {"cancelled", "interrupted"}:
+    try:
+        progress_cb()
+        if job.status in {"cancelled", "interrupted"}:
+            terminate_process_group(proc)
+
+        dest = expected_dest
+        progress_dir = expected_dest.parent if expected_dest else None
+        if progress_dir is None and "-o" in cmd:
+            o_index = cmd.index("-o")
+            if o_index + 1 < len(cmd) and not cmd[o_index + 1].startswith("-"):
+                progress_dir = Path(cmd[o_index + 1]).parent
+
+        patterns = _download_patterns()
+        tail: deque[str] = deque(maxlen=12)
+        for raw_line in proc.stdout or []:
+            line = raw_line.rstrip()
+            if line:
+                tail.append(line)
+            dest = _handle_download_line(
+                job,
+                line,
+                dest,
+                progress_dir,
+                progress_cb,
+                patterns,
+            )
+
+        proc.wait()
+        return proc.returncode, dest, tail
+    except BaseException:
         terminate_process_group(proc)
-    dest = expected_dest
-    progress_dir = expected_dest.parent if expected_dest else None
-    if progress_dir is None and "-o" in cmd:
-        progress_dir = Path(cmd[cmd.index("-o") + 1]).parent
-    pct_re = re.compile(r"\[download\].*?([\d.]+)%")
-    speed_re = re.compile(r"\bat\s+([\d.]+\s*[^\s]+)")
-    eta_re = re.compile(r"\bETA\s+(\S+)")
-    done_re = re.compile(r"\[download\]\s+100%\s+of")
-    dest_re = re.compile(r"\[download\] Destination: (.+)")
-    merge_re = re.compile(r'\[Merger\] Merging formats into "(.+)"')
-    print_re = re.compile(r"__FETCHER_DEST__:(.+)")
-    ffmpeg_time_re = re.compile(r"time=(\S+)")
-    aria_re = re.compile(r"\[#[^\s]+\s+[^\s]+\((\d+)%\).*?\bDL:([^\s\]]+)(?:\s+ETA:([^\s\]]+))?")
-    tail: deque[str] = deque(maxlen=12)
-    for line in proc.stdout or []:
-        line = line.rstrip()
-        if line:
-            tail.append(line)
-        if m := aria_re.search(line):
-            job.progress = float(m.group(1))
-            job.speed = m.group(2) + "/s"
-            job.eta = m.group(3) or ""
-            if progress_dir:
-                job.downloaded_bytes = _job_temp_bytes(progress_dir)
-            progress_cb()
-        elif m := pct_re.search(line):
-            job.progress = float(m.group(1))
-            if speed := speed_re.search(line):
-                job.speed = speed.group(1)
-            if eta := eta_re.search(line):
-                job.eta = eta.group(1)
-            if progress_dir:
-                job.downloaded_bytes = _job_temp_bytes(progress_dir)
-            progress_cb()
-        elif done_re.search(line):
-            job.progress = 100.0; job.speed = ""; job.eta = ""
-            if progress_dir:
-                job.downloaded_bytes = _job_temp_bytes(progress_dir)
-            progress_cb()
-        elif m := dest_re.search(line):
-            dest = Path(m.group(1).strip())
-        elif m := merge_re.search(line):
-            dest = Path(m.group(1).strip().strip('"'))
-        elif m := print_re.search(line):
-            dest = Path(m.group(1).strip())
-        elif m := ffmpeg_time_re.search(line):
-            job.eta = f"ffmpeg {m.group(1)}"
-            if progress_dir:
-                job.downloaded_bytes = _job_temp_bytes(progress_dir)
-            progress_cb()
-    proc.wait(); job.proc = None
-    return proc.returncode, dest, tail
+        raise
+    finally:
+        job.proc = None
+        if proc.stdout is not None:
+            proc.stdout.close()
 
 
 def _failure_from_tail(tail: deque[str], returncode: int) -> str:
@@ -283,6 +441,12 @@ def _failure_from_tail(tail: deque[str], returncode: int) -> str:
 def _best_download_failure(failures: list[str], fallback: str) -> str:
     if not failures:
         return fallback
+    # A quality-floor or age-wall rejection is more actionable than a later
+    # generic extractor error, and explains why no transfer was attempted.
+    for failure in failures:
+        lowered = failure.lower()
+        if "fetcher requires" in lowered or "age-verification" in lowered or "age verification" in lowered:
+            return failure
     generic_markers = ("unsupported url", "forcing generic information extractor")
     if fallback and not any(marker in fallback.lower() for marker in generic_markers):
         return fallback
@@ -336,6 +500,7 @@ def _build_ytdlp_download_cmd(ytdlp_cmd: list[str], job: DownloadJob, job_tmp_di
     # --print implies quiet mode, which suppresses the [download] lines the UI parses.
     cmd = [*ytdlp_cmd, "-o", str(job_tmp_dir / (filename_template.strip() or "%(title)s.%(ext)s")), "-f", format_selector, "--merge-output-format", "mkv", "--check-formats", "--no-playlist", "--newline", "--progress", "--no-warnings", "--retries", "3", "--fragment-retries", "5", "--continue", "--part", "--concurrent-fragments", str(max(1, concurrent_fragments)), "--print", "after_move:__FETCHER_DEST__:%(filepath)s"]
     cmd.extend(["--socket-timeout", "20"])
+    cmd.extend(_impersonation_args())
     aria2 = shutil.which("aria2c")
     if not aria2:
         # Installed entry points may run without the environment's bin on PATH.
@@ -361,12 +526,18 @@ def _is_pornhub_phantomjs_error(error: str) -> bool:
     return "pornhub" in lowered and "phantomjs" in lowered
 
 
+_BROWSER_FALLBACK_MARKERS = (
+    "phantomjs", "no video formats", "unable to extract", "unsupported url",
+    # A height-constrained selector that cannot be satisfied is the normal
+    # signal that the site hides its HD formats behind runtime player data.
+    "requested format is not available", "format is not available",
+    "drm", "hls", "m3u8",
+)
+
+
 def _needs_browser_fallback(video: Video, error: str) -> bool:
-    return video.site in {"PornHub", "RedTube", "xHamster"} and any(
-        marker in error.lower() for marker in (
-            "phantomjs", "no video formats", "unable to extract", "unsupported url",
-        )
-    )
+    """Any site may hide its player data behind JavaScript, not just PornHub."""
+    return any(marker in error.lower() for marker in _BROWSER_FALLBACK_MARKERS)
 
 
 def _parse_quality(value: object) -> Optional[int]:
@@ -389,7 +560,8 @@ def _pornhub_media_urls_from_html(text: str) -> list[tuple[int, str]]:
         return []
     try:
         flashvars, _ = json.JSONDecoder().raw_decode(text[match.end():].lstrip())
-    except ValueError:
+    except Exception:
+        # Truncated/garbled player data can raise more than ValueError.
         return []
     if not isinstance(flashvars, dict):
         return []
@@ -434,10 +606,19 @@ const done = arguments[arguments.length - 1];
     }
     const hls = window.xplayer?.core?.sourceController?.chromecastSource;
     if (typeof hls === 'string') definitions.push({videoUrl: hls});
-    for (const video of document.querySelectorAll('video, video source')) {
-        const src = video.currentSrc || (video.getAttribute('src') ? video.src : null);
+    for (const el of document.querySelectorAll('video, video source, source')) {
+        const src = el.currentSrc || (el.getAttribute('src') ? el.src : null);
         if (src && src !== location.href && /^https?:/.test(src)) definitions.push({videoUrl: src});
     }
+    // Bounded, defensive scan of the raw page for stream URLs (works for
+    // arbitrary hosts, e.g. SearXNG-resolved tube sites).
+    try {
+        const html = document.documentElement.outerHTML;
+        const scanned = html.match(/https?:[^"'\\\s]+\.m3u8[^"'\\\s]*/gi) || [];
+        const mp4s = html.match(/https?:[^"'\\\s]+\.mp4[^"'\\\s]*/gi) || [];
+        for (const url of scanned.slice(0, 20)) definitions.push({videoUrl: url});
+        for (const url of mp4s.slice(0, 20)) definitions.push({videoUrl: url});
+    } catch (_) {}
     const expanded = await Promise.all(definitions.map(async definition => {
         const url = definition.videoUrl;
         if (typeof url !== 'string') return [];
@@ -455,8 +636,112 @@ const done = arguments[arguments.length - 1];
 """
 
 
-def _resolve_pornhub_browser_urls(video: Video) -> tuple[list[str], Optional[str]]:
-    """Resolve runtime player data when the site's static extractor fails."""
+def _is_pornhub_download(video: Video) -> bool:
+    return video.site == "PornHub" or "pornhub" in urlparse(video.url or "").netloc.lower()
+
+
+def _accept_pornhub_age_prompt(driver) -> None:
+    """Click PornHub's 18+ Enter control when the disclaimer is rendered."""
+    selectors = (
+        "#js-ageDisclaimerModal .js-closeAgeModal",
+        "#js-ageDisclaimerModal .buttonOver18",
+        "#js-ageDisclaimerModal .js-av-cta.buttonOver18",
+    )
+    for selector in selectors:
+        try:
+            elements = driver.find_elements("css selector", selector)
+        except Exception:
+            continue
+        for element in elements:
+            try:
+                element.click()
+                return
+            except Exception:
+                continue
+
+
+def _prepare_pornhub_browser_session(driver) -> None:
+    """Seed the accepted 18+ cookies before loading a PornHub player page."""
+    try:
+        driver.get("https://www.pornhub.com/")
+    except Exception:
+        return
+    for name, value in (
+        ("accessAgeDisclaimerPH", "2"),
+        ("age_verified", "1"),
+        ("accessPH", "1"),
+        ("platform", "pc"),
+    ):
+        try:
+            driver.add_cookie({
+                "name": name, "value": value, "domain": ".pornhub.com", "path": "/",
+            })
+        except Exception:
+            continue
+    _accept_pornhub_age_prompt(driver)
+
+
+def _browser_age_wall_error(video: Video, driver, requested_url: str) -> Optional[str]:
+    """Explain a browser session that landed on an age wall/homepage instead."""
+    try:
+        page = driver.page_source or ""
+    except Exception:
+        page = ""
+    if is_age_wall_page(page):
+        return age_wall_message(video.site, age_wall_region(page))
+    try:
+        final_url = str(driver.current_url or "")
+    except Exception:
+        final_url = ""
+    if not final_url:
+        return None
+    requested = urlparse(requested_url)
+    final = urlparse(final_url)
+    requested_host = (requested.hostname or "").lower()
+    final_host = (final.hostname or "").lower()
+    same_site = (
+        requested_host == final_host
+        or requested_host.endswith("." + final_host)
+        or final_host.endswith("." + requested_host)
+    )
+    requested_path = (requested.path or "/").rstrip("/") or "/"
+    final_path = (final.path or "/").rstrip("/") or "/"
+    if same_site and requested_path != "/" and final_path == "/":
+        return age_wall_message(video.site, age_wall_region(page))
+    return None
+
+
+def _select_browser_media_url(
+    video: Video,
+    media_urls: list[tuple[int, str]],
+    min_height: int,
+) -> tuple[list[str], Optional[str]]:
+    """Pick a runtime stream without ever preferring a known sub-floor quality."""
+    if min_height <= 0:
+        return [media_urls[0][1]], None
+    eligible = [url for quality, url in media_urls if quality >= min_height]
+    if eligible:
+        return [eligible[0]], None
+    # Some sites expose a single stream without any quality metadata (for
+    # example a bare HLS master URL). Keep it as a last resort; the final
+    # ffprobe check still rejects it if it turns out to be below the floor.
+    unknown = [url for quality, url in media_urls if quality <= 0]
+    if unknown:
+        return [unknown[0]], None
+    best_height = max(quality for quality, _ in media_urls)
+    return [], (
+        f"{video.site} exposes only {best_height}p media in the browser player; "
+        f"Fetcher requires {min_height}p+"
+    )
+
+
+def _resolve_browser_media_urls(video: Video, min_height: int = 0) -> tuple[list[str], Optional[str]]:
+    """Resolve runtime player data when a site's static extractor fails.
+
+    Works for any host, not just the originally supported tube sites. When a
+    minimum height is configured, known lower-quality player sources are never
+    selected ahead of an eligible one.
+    """
     try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options
@@ -468,7 +753,17 @@ def _resolve_pornhub_browser_urls(video: Video) -> tuple[list[str], Optional[str
         driver = webdriver.Chrome(options=opts)
         driver.set_page_load_timeout(30)
         driver.set_script_timeout(12)
-        driver.get(_provider_download_url(video))
+        pornhub = _is_pornhub_download(video)
+        requested_url = _provider_download_url(video)
+        if pornhub:
+            _prepare_pornhub_browser_session(driver)
+        driver.get(requested_url)
+        if pornhub:
+            _accept_pornhub_age_prompt(driver)
+        else:
+            gate_error = _browser_age_wall_error(video, driver, requested_url)
+            if gate_error:
+                return [], gate_error
         media_urls: list[tuple[int, str]] = []
         deadline = time.monotonic() + 15
         for _ in range(12):
@@ -481,8 +776,15 @@ def _resolve_pornhub_browser_urls(video: Video) -> tuple[list[str], Optional[str
                 break
             time.sleep(0.5)
         if not media_urls:
+            if pornhub:
+                try:
+                    page = driver.page_source or ""
+                except Exception:
+                    page = ""
+                if is_pornhub_age_gate_page(page) or is_pornhub_sfw_page(page):
+                    return [], pornhub_age_gate_message()
             return [], f"{video.site} browser fallback found no media URLs; check site availability in Chrome"
-        return [media_urls[0][1]], None
+        return _select_browser_media_url(video, media_urls, min_height)
     except Exception as exc:
         return [], f"{video.site} browser fallback failed: {exc}"
     finally:
@@ -493,8 +795,39 @@ def _resolve_pornhub_browser_urls(video: Video) -> tuple[list[str], Optional[str
                 pass
 
 
-def _resolve_direct_download_urls(video: Video, ytdlp_cmd: list[str], *, force_generic: bool) -> tuple[list[str], Optional[str]]:
-    cmd = [*ytdlp_cmd, "-g", "--no-playlist", "-f", YTDLP_FLEX_FORMAT]
+def _resolve_pornhub_browser_urls(video: Video, min_height: int = 0) -> tuple[list[str], Optional[str]]:
+    """Backward-compatible dispatcher for :func:`_resolve_browser_media_urls`.
+
+    Kept because existing tests and ``fetchtui`` import/patch this name; it
+    delegates at call time so patching either name takes effect.
+    """
+    return _resolve_browser_media_urls(video, min_height=min_height)
+
+
+def _download_attempts(min_height: int) -> list[tuple[str, str, bool]]:
+    """Return yt-dlp attempts that never select a known sub-floor quality."""
+    if min_height > 0:
+        selector = _ytdlp_format(min_height)
+        return [
+            (f"yt-dlp {min_height}p+", selector, False),
+            (f"yt-dlp {min_height}p+ generic", selector, True),
+        ]
+    return [
+        ("yt-dlp flexible", YTDLP_FLEX_FORMAT, False),
+        ("yt-dlp generic", YTDLP_FLEX_FORMAT, True),
+    ]
+
+
+def _resolve_direct_download_urls(
+    video: Video,
+    ytdlp_cmd: list[str],
+    *,
+    force_generic: bool,
+    min_height: int = 0,
+) -> tuple[list[str], Optional[str]]:
+    selector = _ytdlp_format(min_height) if min_height > 0 else YTDLP_FLEX_FORMAT
+    cmd = [*ytdlp_cmd, "-g", "--no-playlist", "-f", selector]
+    cmd.extend(_impersonation_args())
     if force_generic:
         cmd.append("--force-generic-extractor")
     cmd.extend(_site_ytdlp_args(video)); cmd.append(_provider_download_url(video))
@@ -506,7 +839,7 @@ def _resolve_direct_download_urls(video: Video, ytdlp_cmd: list[str], *, force_g
     if proc.returncode != 0:
         error = (proc.stderr or proc.stdout).strip() or f"yt-dlp exit {proc.returncode}"
         if not force_generic and _needs_browser_fallback(video, error):
-            browser_urls, browser_error = _resolve_pornhub_browser_urls(video)
+            browser_urls, browser_error = _resolve_pornhub_browser_urls(video, min_height=min_height)
             if browser_urls:
                 return browser_urls, None
             return urls, browser_error or error
@@ -514,17 +847,29 @@ def _resolve_direct_download_urls(video: Video, ytdlp_cmd: list[str], *, force_g
     return urls, None
 
 
-def _run_ffmpeg_fallback(job: DownloadJob, urls: list[str], job_tmp_dir: Path, progress_cb) -> tuple[int, Optional[Path], deque[str]]:
+def _run_ffmpeg_fallback(
+    job: DownloadJob,
+    urls: list[str],
+    job_tmp_dir: Path,
+    progress_cb,
+    min_height: int = 0,
+) -> tuple[int, Optional[Path], deque[str]]:
     if not FFMPEG:
         return 1, None, deque(["ffmpeg is not installed"], maxlen=12)
     if not urls:
         return 1, None, deque(["no direct media URLs found"], maxlen=12)
+    below_floor = _resolved_stream_below_floor(urls[0], job.video, min_height)
+    if below_floor:
+        return 1, None, deque([below_floor], maxlen=12)
     output = job_tmp_dir / f"{_safe_media_stem(job.video)}.mkv"
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "warning"]
     referer = _provider_download_url(job.video)
+    cookie_args = ["-cookies", PORNHUB_COOKIE_HEADER] if _is_pornhub_download(job.video) else []
     for url in urls[:2]:
         url = url.split("#__youtubedl_smuggle=", 1)[0]
-        cmd.extend(["-user_agent", HEADERS["User-Agent"], "-referer", referer, "-i", url])
+        cmd.extend(["-user_agent", HEADERS["User-Agent"], "-referer", referer])
+        cmd.extend(cookie_args)
+        cmd.extend(["-i", url])
     if len(urls) >= 2:
         cmd.extend(["-map", "0:v:0", "-map", "1:a:0?"])
     cmd.extend(["-c", "copy", str(output)])
@@ -543,7 +888,7 @@ def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, d
     ytdlp_cmd, ytdlp_error = resolve_ytdlp_command()
     if ytdlp_error or not ytdlp_cmd:
         job.status = "failed"; job.eta = ytdlp_error or "yt-dlp is unavailable"; done_cb(job); return
-    attempts = [("yt-dlp HD", _ytdlp_format(policy.min_height), False), ("yt-dlp flexible", YTDLP_FLEX_FORMAT, False), ("yt-dlp generic", YTDLP_FLEX_FORMAT, True)]
+    attempts = _download_attempts(policy.min_height)
     last_failure = ""; failures: list[str] = []
     browser_attempted = False
     for label, format_selector, force_generic in attempts:
@@ -570,37 +915,48 @@ def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, d
             if job.status in {"cancelled", "interrupted"}:
                 done_cb(job)
                 return
-            urls, browser_error = _resolve_pornhub_browser_urls(job.video)
+            urls, browser_error = _resolve_pornhub_browser_urls(job.video, min_height=policy.min_height)
             if job.status in {"cancelled", "interrupted"}:
                 done_cb(job)
                 return
             if urls:
-                job.status = "downloading"
-                direct_cmd = _build_ytdlp_download_cmd(
-                    ytdlp_cmd, job, job_tmp_dir, filename_template,
-                    YTDLP_FLEX_FORMAT, concurrent_fragments,
-                )
-                literal_title = (job.video.title or job.video.id).replace("%", "%%").replace(":", r"\:")
-                direct_cmd[-1:] = [
-                    "--referer", _provider_download_url(job.video),
-                    "--user-agent", HEADERS["User-Agent"],
-                    "--parse-metadata", f"{literal_title}:%(title)s",
-                    urls[0],
-                ]
-                returncode, dest, tail = _run_download_process(job, direct_cmd, progress_cb)
+                below_floor = _resolved_stream_below_floor(urls[0], job.video, policy.min_height)
                 if job.status in {"cancelled", "interrupted"}:
+                    # The bounded ffprobe pre-check can span a user Stop request.
                     done_cb(job)
                     return
-                if returncode == 0:
-                    _finalize_downloaded_file(job, dest, job_tmp_dir, plex_dir, organize_by_site, policy)
-                    break
-                browser_error = _failure_from_tail(tail, returncode)
+                if below_floor:
+                    browser_error = below_floor
+                else:
+                    job.status = "downloading"
+                    direct_cmd = _build_ytdlp_download_cmd(
+                        ytdlp_cmd, job, job_tmp_dir, filename_template,
+                        YTDLP_FLEX_FORMAT, concurrent_fragments,
+                    )
+                    literal_title = (job.video.title or job.video.id).replace("%", "%%").replace(":", r"\:")
+                    direct_cmd[-1:] = [
+                        "--referer", _provider_download_url(job.video),
+                        "--user-agent", HEADERS["User-Agent"],
+                        *(["--add-header", f"Cookie: {PORNHUB_COOKIE_HEADER}"] if _is_pornhub_download(job.video) else []),
+                        "--parse-metadata", f"{literal_title}:%(title)s",
+                        urls[0],
+                    ]
+                    returncode, dest, tail = _run_download_process(job, direct_cmd, progress_cb)
+                    if job.status in {"cancelled", "interrupted"}:
+                        done_cb(job)
+                        return
+                    if returncode == 0:
+                        _finalize_downloaded_file(job, dest, job_tmp_dir, plex_dir, organize_by_site, policy)
+                        break
+                    browser_error = _failure_from_tail(tail, returncode)
             if browser_error:
                 failures.append(browser_error)
         job.status = "downloading"; job.progress = 0.0; job.speed = ""
     else:
         for force_generic in ((True,) if browser_attempted else (False, True)):
-            urls, error = _resolve_direct_download_urls(job.video, ytdlp_cmd, force_generic=force_generic)
+            urls, error = _resolve_direct_download_urls(
+                job.video, ytdlp_cmd, force_generic=force_generic, min_height=policy.min_height,
+            )
             if job.status in {"cancelled", "interrupted"}:
                 done_cb(job)
                 return
@@ -609,7 +965,9 @@ def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, d
                 if error:
                     failures.append(error)
                 continue
-            returncode, dest, tail = _run_ffmpeg_fallback(job, urls, job_tmp_dir, progress_cb)
+            returncode, dest, tail = _run_ffmpeg_fallback(
+                job, urls, job_tmp_dir, progress_cb, min_height=policy.min_height,
+            )
             if job.status in {"cancelled", "interrupted"}:
                 done_cb(job)
                 return
@@ -648,8 +1006,9 @@ def resolve_stream_urls(video: Video) -> tuple[list[str], Optional[str]]:
     if ytdlp_error or not ytdlp_cmd:
         return [], ytdlp_error or "yt-dlp is unavailable"
     cmd = [*ytdlp_cmd, "-g", "--no-playlist", "-f", YTDLP_FORMAT]
+    cmd.extend(_impersonation_args())
     if video.site == "Twitter":
-        cmd.extend(["--cookies-from-browser", "chrome"])
+        cmd.extend(_twitter_cookie_args())
     cmd.append(_provider_download_url(video))
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)

@@ -479,7 +479,7 @@ def test_search_adapter_returns_provider_errors_with_empty_results() -> None:
     class Module:
         LAST_PROVIDER_ERRORS: dict[str, str] = {}
 
-        def search_videos(self, query, provider, filters, twitter_count=40):
+        def search_videos(self, query, provider, filters, twitter_count=40, settings=None):
             self.LAST_PROVIDER_ERRORS["PornHub"] = "regional access blocked"
             return []
 
@@ -491,6 +491,22 @@ def test_search_adapter_returns_provider_errors_with_empty_results() -> None:
     assert result["results"] == []
     assert "PornHub" in result["warning"]
     assert "blocked" in result["warning"]
+
+
+def test_search_adapter_displays_catalog_warning_with_results() -> None:
+    class Module:
+        LAST_PROVIDER_ERRORS = {}
+        LAST_PROVIDER_WARNINGS = {"Eporner": "stale warning"}
+
+        def search_videos(self, query, provider, filters, twitter_count=40, settings=None):
+            self.LAST_PROVIDER_WARNINGS["PornHub"] = "Restricted SFW catalog"
+            return [Video("hit", "Result", 120, 0, "https://example.test/hit", "PornHub")]
+
+    result = gui_app.SearchAdapter(Module(), AppSettings()).search("needle", "PornHub", {})
+
+    assert len(result["results"]) == 1
+    assert "PornHub: Restricted SFW catalog" in result["warning"]
+    assert "stale warning" not in result["warning"]
 
 
 def test_discover_loads_thumbnails_reports_errors_and_queues_off_thread(qtbot) -> None:
@@ -852,6 +868,20 @@ def test_settings_form_saves_paths_concurrency_cache_and_runs_diagnostics(qtbot)
     assert "restart required" in page.status_label.text().lower()
 
 
+def test_settings_min_download_height_round_trips(qtbot) -> None:
+    service = StubSettings()
+    service.settings = replace(service.settings, min_download_height=0)
+    page = SettingsPage(service, thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+
+    assert page.min_height_spin.value() == 0
+
+    page.min_height_spin.setValue(1080)
+    page.save_settings()
+
+    assert service.saved[-1].min_download_height == 1080
+
+
 def test_settings_validation_failure_does_not_persist_and_is_visible(qtbot) -> None:
     service = StubSettings()
     service.validate = lambda _settings, _preferences: (_ for _ in ()).throw(ValueError("staging is not writable"))
@@ -1048,7 +1078,7 @@ def test_production_composition_builds_callable_non_null_services(tmp_path) -> N
         pass
 
     fake_fetchtui = SimpleNamespace(
-        search_videos=lambda query, provider, filters, twitter_count=40:
+        search_videos=lambda query, provider, filters, twitter_count=40, settings=None:
             searched.append((query, provider, filters)) or [Video("one", "One", 1, 1, "url", provider)],
         resolve_stream_urls=lambda _video: (["https://media/stream.m3u8"], None),
         create_download_manager=lambda settings, temp, output, history_store=None:

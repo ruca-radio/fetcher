@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -138,18 +139,12 @@ def _ensure_writable_dir(path: Path, fallback: Path, label: str) -> tuple[Path, 
     primary = path.expanduser()
     fallback = fallback.expanduser()
 
-    def prepare(candidate: Path) -> None:
-        candidate.mkdir(parents=True, exist_ok=True)
-        probe = candidate / ".fetcher-write-test"
-        probe.touch()
-        probe.unlink()
-
     try:
-        prepare(primary)
+        _probe_writable_directory(primary)
         return primary, None
     except Exception as primary_exc:
         try:
-            prepare(fallback)
+            _probe_writable_directory(fallback)
             return fallback, f"{label} directory {primary} is unavailable ({primary_exc}); using {fallback} instead."
         except Exception as fallback_exc:
             raise RuntimeError(
@@ -202,14 +197,14 @@ class SettingsStore:
     def load(self) -> SettingsLoadResult:
         if not self.path.exists():
             self._unknown = {}
-            return SettingsLoadResult(replace(self.defaults), {})
+            return SettingsLoadResult(deepcopy(self.defaults), {})
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("settings root must be an object")
         except Exception as exc:
             self._unknown = {}
-            return SettingsLoadResult(replace(self.defaults), {}, (f"Unable to read settings: {exc}",))
+            return SettingsLoadResult(deepcopy(self.defaults), {}, (f"Unable to read settings: {exc}",))
 
         self._unknown = {key: value for key, value in data.items() if key not in KNOWN_KEYS}
         search_data = data.get("search_filters") if isinstance(data.get("search_filters"), dict) else {}
@@ -248,12 +243,12 @@ class SettingsStore:
                 ),
             )
         except (TypeError, ValueError) as exc:
-            return SettingsLoadResult(replace(self.defaults), self._unknown.copy(), (f"Invalid settings: {exc}",))
+            return SettingsLoadResult(deepcopy(self.defaults), self._unknown.copy(), (f"Invalid settings: {exc}",))
         try:
             validated = self.validate(settings)
         except (TypeError, ValueError) as exc:
             return SettingsLoadResult(
-                replace(self.defaults),
+                deepcopy(self.defaults),
                 self._unknown.copy(),
                 (f"Invalid settings: {exc}",),
             )

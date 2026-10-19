@@ -5,8 +5,10 @@ Fetcher is a standalone video search, preview, and download application. It ship
 ## Highlights
 
 - Multi-site search across PornHub, xHamster, RedTube, and Eporner
+- Optional SearXNG web search (opt-in) that surfaces additional tube sites and resolves them through yt-dlp
 - Twitter/X media search via local cookie import
 - Queue-based downloads with configurable parallelism
+- Browser-impersonated extraction (curl_cffi via yt-dlp `--impersonate`) plus an any-site Selenium fallback, so more searched videos resolve to a playable stream
 - Native desktop discovery, downloads, library, settings, and media playback
 - In-app playback through `mpv`
 - Downloaded-file browser inside the TUI
@@ -57,7 +59,7 @@ HTTP/HTTPS video files use aria2 when installed, with up to 16 connections contr
 
 If PornHub, RedTube, or xHamster extraction fails, Fetcher can start a separate headless Chrome session and read the running player's stream data. This requires Chrome and Selenium; it does not use your normal Chrome profile. Site login, regional restrictions, and unavailable videos can still prevent extraction. The Downloads page shows the full failure message below the table and in the ETA tooltip.
 
-Completed media must meet `min_download_height` (720p by default). Missing search metadata stays unknown until the file is inspected. Files that fail final quality or preview checks are rejected once, without downloading them again through fallback backends.
+Completed media must meet `min_download_height` (720p by default). Fetcher never selects a known sub-`min_download_height` format: it drives every yt-dlp selector, the direct-URL resolver, and the browser player-data reader from that floor, so when no eligible stream exists the job fails fast with a clear message instead of downloading a low-quality file and deleting it afterwards. Search metadata that omits quality stays unknown until the download stage resolves the site's actual formats; resolved fallback URLs are inspected with `ffprobe` before a transfer starts, and the final `ffprobe` check remains a safety net.
 
 ## Quick Start
 
@@ -115,7 +117,7 @@ fetcher search "query" --json
 
 Useful search options:
 
-- `--site {All Sites,PornHub,xHamster,RedTube,Eporner,Twitter}`
+- `--site {All Sites,PornHub,xHamster,RedTube,Eporner,SearXNG,Twitter}` (`SearXNG` requires enabling SearXNG in settings)
 - `--pages N`
 - `--min-duration MINUTES`
 - `--max-duration MINUTES`
@@ -143,7 +145,7 @@ Download multiple targets:
 fetcher download URL1 URL2 URL3
 ```
 
-If you provide a bare ID instead of a full URL, the CLI currently assumes `PornHub` unless you explicitly set `--site`.
+If you provide a bare ID instead of a full URL, set `--site` so Fetcher can expand it into the canonical watch URL. Bare IDs are expanded for `PornHub`, `xHamster`, `RedTube`, and `Eporner`; other sites require a full URL.
 
 Optional download arguments:
 
@@ -216,6 +218,8 @@ You can also use the TUI login dialog and paste either:
 - a raw `auth_token`
 - a JSON object containing `auth_token`
 
+Fetcher uses this stored cookie state for both Twitter/X search and downloads. For downloads it converts the JSON into a temporary Netscape cookie file for yt-dlp, so Twitter/X downloads no longer require a Chrome profile (Fetcher only falls back to `--cookies-from-browser chrome` when no stored `auth_token` is available).
+
 ## Runtime State
 
 In a source checkout, Fetcher stores local runtime state in:
@@ -232,7 +236,7 @@ This directory includes:
 
 A few `settings.json` values are user-tunable:
 
-- `min_download_height` (default `720`) — rejects downloads below this height; it is also the first yt-dlp format selector, so raising it prefers higher-quality streams.
+- `min_download_height` (default `720`) — quality floor for downloads. It drives every yt-dlp format selector, the direct-URL resolver, and the browser player-data reader, so Fetcher fails fast rather than downloading sub-floor media. Set it to `0` (no minimum) to download sites that only serve sub-720p media. This is editable in both the TUI and GUI settings screens.
 - `eporner_preview_ratio` (default `0.6`) and `eporner_preview_min_seconds` (default `90`) — the Eporner blurred/teaser-preview guard: when a listing is at least `eporner_preview_min_seconds` long, a stream shorter than `eporner_preview_ratio` × the listed duration is rejected.
 - `search_filters.exclude_censored` (default `true`) — skips Eporner censored/mosaic uploads; also toggleable in the TUI search-filter screen.
 
@@ -256,6 +260,10 @@ Both paths can be changed in the GUI or TUI and overridden in CLI commands.
 
 ## Troubleshooting
 
+- If PornHub search reports an 18+ age-verification restriction or its restricted SFW catalog, PornHub is refusing the full catalog to this network/region. Fetcher sends the same age-gate cookies a browser's 18+ "Enter" control sets (`accessAgeDisclaimerPH`, `age_verified`, `accessPH`), retries gated requests, and accepts the prompt in its headless-Chrome fallback, but the prompt alone cannot unlock PornHub's server-side restricted catalog. Change the VPN or network exit to a non-restricted region and retry.
+- If a video extracts on the site but fails in Fetcher, the download stages fall back through yt-dlp (with curl_cffi browser impersonation when available), then a headless-Chrome player-data reader that now works for any host, and finally a direct ffmpeg copy. A failure message always names the last stage that was tried.
+- If a RedTube (or another Aylo site) download reports that the site "has disabled access from <region> (regional age-verification requirements) and served its age-verification wall/homepage instead of the requested video", the site redirected this network to its age wall. The real video page and its HD streams are unavailable from that region, and the age-wall page only contains a low-quality promo clip; Fetcher refuses to download the promo. Change the network/VPN exit to a region where the site serves the full catalog and retry.
+- If a download fails with a message that only sub-`min_download_height` media is available, Fetcher refused to transfer it. Lower `min_download_height` (0 disables the floor) in the TUI or GUI settings if a site only serves sub-720p media; the download no longer wastes bandwidth on a rejected file.
 - If `fetcher gui` reports that PySide6 is missing, run `python -m pip install 'fetcher-v1[gui]'` (or `python -m pip install '.[gui]'` from a checkout).
 - If video playback is unavailable, install your distribution's Qt Multimedia runtime and verify `ffprobe` can inspect the file. The TUI uses `mpv` separately.
 - If SFTP storage is unavailable, first confirm `sftp host` connects non-interactively with the same user account. Finished downloads remain in local staging for a later transfer.

@@ -5,8 +5,44 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from fetcher_core.models import BASE_DIR, AppSettings, DownloadPolicy, SearchFilters
 from fetcher_core.settings import SettingsStore, parse_sftp_storage, prepare_runtime_settings
+
+
+def test_runtime_directory_probe_preserves_existing_files(tmp_path):
+    from fetcher_core.settings import resolve_runtime_dirs
+
+    output = tmp_path / "output"
+    temporary = tmp_path / "temporary"
+    for directory in (output, temporary):
+        directory.mkdir()
+        (directory / ".fetcher-write-test").write_text("keep me")
+
+    resolved_tmp, resolved_output, warnings = resolve_runtime_dirs(AppSettings(
+        plex_dir=str(output), tmp_dir=str(temporary),
+    ))
+
+    assert (resolved_tmp, resolved_output, warnings) == (temporary, output, [])
+    for directory in (output, temporary):
+        assert (directory / ".fetcher-write-test").read_text() == "keep me"
+        assert [path.name for path in directory.iterdir()] == [".fetcher-write-test"]
+
+
+@pytest.mark.parametrize("contents", [None, "{broken", '{"parallel_downloads": "bad"}',
+                                     '{"plex_dir": "sftp:invalid"}'])
+def test_settings_fallback_does_not_share_mutable_filters(tmp_path, contents):
+    path = tmp_path / "settings.json"
+    defaults = AppSettings(search_filters=SearchFilters(pages=4))
+    store = SettingsStore(path, defaults=defaults)
+
+    if contents is not None:
+        path.write_text(contents)
+    loaded = store.load()
+    loaded.settings.search_filters.pages = 9
+    assert defaults.search_filters.pages == 4
+    assert store.load().settings.search_filters.pages == 4
 
 
 class SettingsStoreTests(unittest.TestCase):
