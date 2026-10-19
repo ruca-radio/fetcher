@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from fetcher_core import provider_login
 from fetcher_core.age_gate import (
     PORNHUB_COOKIE_HEADER,
     age_wall_message,
@@ -181,6 +182,13 @@ def _twitter_cookie_args() -> list[str]:
 
 
 def _site_ytdlp_args(video: Video) -> list[str]:
+    if video.site in provider_login.SIGN_IN_SITES:
+        try:
+            cookie_file = provider_login.netscape_cookie_file(video.site)
+        except Exception:
+            cookie_file = None
+        if cookie_file is not None:
+            return ["--cookies", str(cookie_file)]
     if video.site == "Twitter":
         return _twitter_cookie_args()
     return []
@@ -281,8 +289,9 @@ def _probe_remote_media_height(url: str, video: Video) -> Optional[int]:
         "-referer", _provider_download_url(video),
         "-probesize", "5000000", "-analyzeduration", "5000000",
     ]
-    if _is_pornhub_download(video):
-        cmd.extend(["-cookies", PORNHUB_COOKIE_HEADER])
+    cookie_header = _session_cookie_header(video)
+    if cookie_header:
+        cmd.extend(["-headers", f"Cookie: {cookie_header}\r\n"])
     cmd.append(url)
     try:
         proc = subprocess.run(
@@ -640,6 +649,21 @@ def _is_pornhub_download(video: Video) -> bool:
     return video.site == "PornHub" or "pornhub" in urlparse(video.url or "").netloc.lower()
 
 
+def _session_cookie_header(video: Video) -> str:
+    """Combine PornHub's age-gate cookies with a stored provider session."""
+    parts: list[str] = []
+    if _is_pornhub_download(video):
+        parts.append(PORNHUB_COOKIE_HEADER)
+    if video.site in provider_login.SIGN_IN_SITES:
+        try:
+            stored = provider_login.cookie_header(video.site)
+        except Exception:
+            stored = ""
+        if stored:
+            parts.append(stored)
+    return "; ".join(parts)
+
+
 def _accept_pornhub_age_prompt(driver) -> None:
     """Click PornHub's 18+ Enter control when the disclaimer is rendered."""
     selectors = (
@@ -755,8 +779,18 @@ def _resolve_browser_media_urls(video: Video, min_height: int = 0) -> tuple[list
         driver.set_script_timeout(12)
         pornhub = _is_pornhub_download(video)
         requested_url = _provider_download_url(video)
+        stored_cookies = (
+            provider_login.load_cookies(video.site)
+            if video.site in provider_login.SIGN_IN_SITES
+            else []
+        )
         if pornhub:
             _prepare_pornhub_browser_session(driver)
+            if stored_cookies:
+                provider_login.apply_to_selenium(driver, video.site)
+        elif stored_cookies:
+            driver.get(provider_login.SITE_HOME_URLS[video.site])
+            provider_login.apply_to_selenium(driver, video.site)
         driver.get(requested_url)
         if pornhub:
             _accept_pornhub_age_prompt(driver)
@@ -864,7 +898,8 @@ def _run_ffmpeg_fallback(
     output = job_tmp_dir / f"{_safe_media_stem(job.video)}.mkv"
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "warning"]
     referer = _provider_download_url(job.video)
-    cookie_args = ["-cookies", PORNHUB_COOKIE_HEADER] if _is_pornhub_download(job.video) else []
+    cookie_header = _session_cookie_header(job.video)
+    cookie_args = ["-headers", f"Cookie: {cookie_header}\r\n"] if cookie_header else []
     for url in urls[:2]:
         url = url.split("#__youtubedl_smuggle=", 1)[0]
         cmd.extend(["-user_agent", HEADERS["User-Agent"], "-referer", referer])
@@ -1012,8 +1047,7 @@ def resolve_stream_urls(video: Video) -> tuple[list[str], Optional[str]]:
         return [], ytdlp_error or "yt-dlp is unavailable"
     cmd = [*ytdlp_cmd, "-g", "--no-playlist", "-f", YTDLP_FLEX_FORMAT]
     cmd.extend(_impersonation_args())
-    if video.site == "Twitter":
-        cmd.extend(_twitter_cookie_args())
+    cmd.extend(_site_ytdlp_args(video))
     cmd.append(_provider_download_url(video))
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)

@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 from argparse import ArgumentParser, ArgumentTypeError, Namespace
 from io import BytesIO
 from pathlib import Path
@@ -89,6 +90,7 @@ from fetcher_core.filters import (
     split_exclude_phrases as _split_exclude_phrases,
 )
 from fetcher_core.http import HEADERS
+from fetcher_core import provider_login
 from fetcher_core.models import (
     AppSettings,
     DEFAULT_EXCLUDE_PHRASES,
@@ -755,6 +757,8 @@ class FetchTUI(App):
     .settings-row Input, .settings-row Select {
         width: 1fr;
     }
+    .settings-hint { color: $text-muted; height: auto; margin: 0 0 1 0; }
+    #settings-scroll .provider-signin { min-width: 9; margin: 0 1 0 0; }
     #settings-actions { height: auto; }
     #settings-actions Button { margin: 0 1 0 0; }
     #settings-status { color: $text-muted; }
@@ -958,6 +962,28 @@ class FetchTUI(App):
                         with Horizontal(classes="settings-row"):
                             yield Label("Minimum Download Height (0 = no minimum)")
                             yield Input(id="settings-min-height", type="integer")
+                    with Vertical(classes="settings-section"):
+                        yield Static("[bold]Provider Sign-ins[/]", markup=True)
+                        yield Static(
+                            "Sign-in opens a Chrome window; log in there, then close "
+                            "the window. Session cookies are stored owner-only under "
+                            ".fetcher/cookies and used for search, downloads, and previews.",
+                            classes="settings-hint",
+                        )
+                        for _signin_site in provider_login.SIGN_IN_SITES:
+                            with Horizontal(classes="settings-row"):
+                                yield Label(_signin_site)
+                                yield Static("", id=f"settings-signin-{_signin_site.lower()}")
+                                yield Button(
+                                    "Sign in",
+                                    id=f"btn-signin-{_signin_site.lower()}",
+                                    classes="provider-signin",
+                                )
+                                yield Button(
+                                    "Sign out",
+                                    id=f"btn-signout-{_signin_site.lower()}",
+                                    classes="provider-signin",
+                                )
                     with Horizontal(id="settings-actions"):
                         yield Button("Save Settings", variant="primary", id="btn-settings-save")
                         yield Button("Reload Settings", variant="default", id="btn-settings-reload")
@@ -974,6 +1000,7 @@ class FetchTUI(App):
         self._configure_twitter_table()
         self._configure_files_table()
         self._populate_settings_controls()
+        self._refresh_provider_signin_status()
         self._refresh_filter_summary()
         self._refresh_player_status()
         self._load_files()
@@ -1755,6 +1782,96 @@ class FetchTUI(App):
         for warning in warnings:
             self._log(warning)
 
+    def _refresh_provider_signin_status(self) -> None:
+        for site in provider_login.SIGN_IN_SITES:
+            slug = site.lower()
+            try:
+                count = provider_login.cookie_count(site)
+            except Exception:
+                count = 0
+            try:
+                label = self.query_one(f"#settings-signin-{slug}", Static)
+                label.update(f"Signed in ({count} cookies)" if count else "Not signed in")
+                signout = self.query_one(f"#btn-signout-{slug}", Button)
+                signout.disabled = count == 0
+            except Exception:
+                continue
+
+    def _provider_signin_buttons(self) -> list[Button]:
+        buttons = []
+        for site in provider_login.SIGN_IN_SITES:
+            try:
+                buttons.append(self.query_one(f"#btn-signin-{site.lower()}", Button))
+            except Exception:
+                continue
+        return buttons
+
+    def _start_provider_signin(self, site: str) -> None:
+        active = getattr(self, "_signin_site", None)
+        if active:
+            if active == site:
+                self._signin_cancel.set()
+                self._set_settings_status(f"{site}: cancelling sign-in…")
+            else:
+                self._set_settings_status(f"{active}: a sign-in is already in progress.")
+            return
+        self._signin_site = site
+        self._signin_cancel = threading.Event()
+        try:
+            self.query_one(f"#btn-signin-{site.lower()}", Button).label = "Cancel sign-in"
+        except Exception:
+            pass
+        self._set_settings_status(f"{site}: opening Chrome for sign-in…")
+        self._provider_signin_worker(site, self._signin_cancel)
+
+    @work(thread=True)
+    def _provider_signin_worker(self, site: str, cancel: threading.Event) -> None:
+        try:
+            result = provider_login.sign_in(
+                site,
+                cancel=cancel,
+                on_status=lambda message: self.call_from_thread(self._set_settings_status, message),
+            )
+        except Exception as exc:
+            result = provider_login.SignInResult(
+                site, False, 0, f"{site}: sign-in failed ({exc.__class__.__name__}: {exc}).",
+            )
+        self.call_from_thread(self._provider_signin_finished, result)
+
+    def _provider_signin_finished(self, result) -> None:
+        self._signin_site = None
+        self._signin_cancel = None
+        for button in self._provider_signin_buttons():
+            button.label = "Sign in"
+        self._refresh_provider_signin_status()
+        self._set_settings_status(result.message)
+        self._log(result.message)
+
+    def _signout_provider(self, site: str) -> None:
+        try:
+            cleared = provider_login.clear_cookies(site)
+        except Exception as exc:
+            self._set_settings_status(f"{site}: sign-out failed ({exc}).")
+            return
+        self._refresh_provider_signin_status()
+        message = f"{site}: session cleared." if cleared else f"{site}: no stored session."
+        self._set_settings_status(message)
+        self._log(message)
+
+    @on(Button.Pressed, "Button.provider-signin")
+    def _provider_signin_button(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        for site in provider_login.SIGN_IN_SITES:
+            slug = site.lower()
+            if button_id == f"btn-signin-{slug}":
+                self._start_provider_signin(site)
+                event.stop()
+                return
+            if button_id == f"btn-signout-{slug}":
+                self._signout_provider(site)
+                event.stop()
+                return
+
     @on(Button.Pressed, "#btn-settings-save")
     def _settings_save_btn(self) -> None:
         theme = str(self.query_one("#settings-theme", Select).value or self.settings.theme)
@@ -2082,6 +2199,13 @@ def build_parser() -> ArgumentParser:
     )
     batch.add_argument("--json", action="store_true", help="Print selected results as JSON before downloading")
 
+    login = sub.add_parser("login", help="Sign in to a provider in a browser window")
+    login.add_argument("--site", choices=list(provider_login.SIGN_IN_SITES), required=True)
+    login.add_argument("--timeout", type=int, default=600, help="Seconds to wait for the browser sign-in")
+
+    logout = sub.add_parser("logout", help="Forget a stored provider session")
+    logout.add_argument("--site", choices=list(provider_login.SIGN_IN_SITES), required=True)
+
     return parser
 
 
@@ -2173,6 +2297,30 @@ def cli_batch(args: Namespace, settings: AppSettings) -> int:
     return 1 if failures else 0
 
 
+def cli_login(args: Namespace, settings: AppSettings) -> int:
+    try:
+        result = provider_login.sign_in(
+            args.site,
+            timeout_s=max(5, int(args.timeout)),
+            on_status=lambda message: print(message, file=sys.stderr),
+        )
+    except Exception as exc:
+        print(f"{args.site}: sign-in failed ({exc.__class__.__name__}: {exc}).", file=sys.stderr)
+        return 1
+    print(result.message, file=sys.stdout if result.saved else sys.stderr)
+    return 0 if result.saved else 1
+
+
+def cli_logout(args: Namespace, settings: AppSettings) -> int:
+    try:
+        cleared = provider_login.clear_cookies(args.site)
+    except Exception as exc:
+        print(f"{args.site}: sign-out failed ({exc.__class__.__name__}: {exc}).", file=sys.stderr)
+        return 1
+    print(f"{args.site}: {'session cleared.' if cleared else 'no stored session.'}")
+    return 0
+
+
 def _run_gui(argv: Optional[list[str]] = None) -> int:
     _harden_state()
     from fetcher_gui.app import run_gui
@@ -2219,6 +2367,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cli_download(args, settings)
     if args.command == "batch":
         return cli_batch(args, settings)
+    if args.command == "login":
+        return cli_login(args, settings)
+    if args.command == "logout":
+        return cli_logout(args, settings)
 
     parser.print_help()
     return 1

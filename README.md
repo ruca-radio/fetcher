@@ -23,7 +23,7 @@ Fetcher is a standalone video search, preview, and download application. It ship
 - PySide6 and Qt Multimedia for the native GUI
 - `ffmpeg` and `ffprobe` for fallback downloads and media inspection
 - The system `sftp` command for SFTP-backed storage
-- Google Chrome if you want Twitter/X cookie extraction
+- Google Chrome for provider sign-in, the browser fallback, and Twitter/X cookie extraction
 
 ## Installation
 
@@ -186,11 +186,11 @@ The Textual interface includes:
 - Inline queue status and completed-download panels
 - Playback controls for highlighted items
 - A local file browser for the configured output directory
-- Settings for theme, output path, temp path, thumbnails, previews, and search defaults
+- Settings for theme, output path, temp path, thumbnails, previews, search defaults, and provider sign-in
 
 ## Native GUI
 
-The desktop interface provides Discover, Downloads, Library, and Settings workspaces. Search and file operations run outside the UI thread, downloads retain stop/retry state, and the player supports local playback, seeking, volume, mute, and full screen.
+The desktop interface provides Discover, Downloads, Library, and Settings workspaces. Search and file operations run outside the UI thread, downloads retain stop/retry state, and the player supports local playback, seeking, volume, mute, and full screen. Settings includes provider sign-in for PornHub, RedTube, and xHamster.
 
 Local storage paths are used directly. An SFTP destination uses the portable form:
 
@@ -201,6 +201,16 @@ sftp:user=media@host=nas.example.local:22/library/videos
 Fetcher uses the system `sftp` client in batch mode. Configure SSH keys and host verification through your normal SSH configuration; Fetcher does not store SSH passwords. Downloads complete in local staging first, so an unavailable remote destination does not discard finished media.
 
 Remote previews are materialized under `.fetcher/preview-cache` in a source checkout and `$XDG_CACHE_HOME/fetcher/preview-cache` after package installation. The cache is bounded by configured age and size limits, but previewing a large remote file can still require transferring the full file before playback begins. Provider search-result previews depend on the provider exposing a resolvable stream and may be unavailable.
+
+## Provider Sign-In
+
+PornHub, RedTube, and xHamster may require a signed-in session (including an accepted age prompt) before they expose their full catalog, player data, or downloads. Instead of copying cookies by hand:
+
+- TUI: open the **Settings** tab → **Provider Sign-ins** → **Sign in**.
+- GUI: **Settings** → **Provider Sign-ins** → **Sign in**.
+- CLI: `fetcher login --site PornHub` (also `RedTube` / `xHamster`), and `fetcher logout --site PornHub` to forget the session.
+
+Fetcher opens a visible Chrome window on the provider's sign-in page. Log in there (including any 2FA), then close the window; Fetcher captures the resulting session cookies. They are stored owner-only under `.fetcher/cookies` in a source checkout (or `$XDG_DATA_HOME/fetcher/cookies` after package installation), never logged, and used by search requests, yt-dlp downloads, previews, and the browser fallback. **Signing in does not bypass regional age-verification blocks**; see Troubleshooting.
 
 ## Twitter/X Setup
 
@@ -236,6 +246,7 @@ This directory includes:
 - `settings.json`
 - `downloaded_ids.txt`
 - `twitter_cookies.json`
+- `cookies/` — owner-only provider sign-in sessions (PornHub, RedTube, xHamster)
 
 A few `settings.json` values are user-tunable:
 
@@ -263,6 +274,7 @@ Both paths can be changed in the GUI or TUI and overridden in CLI commands.
 
 ## Troubleshooting
 
+- If provider sign-in fails to capture a session, confirm Chrome is installed and that you completed the login before closing the window; the session files live under `.fetcher/cookies` and can be cleared with **Sign out** or `fetcher logout --site <provider>`. Signing in still cannot unlock a network/region that the site blocks outright.
 - If PornHub search reports an 18+ age-verification restriction or its restricted SFW catalog, PornHub is refusing the full catalog to this network/region. Fetcher sends the same age-gate cookies a browser's 18+ "Enter" control sets (`accessAgeDisclaimerPH`, `age_verified`, `accessPH`), retries gated requests, and accepts the prompt in its headless-Chrome fallback, but the prompt alone cannot unlock PornHub's server-side restricted catalog. Change the VPN or network exit to a non-restricted region and retry.
 - If a video extracts on the site but fails in Fetcher, the download stages fall back through yt-dlp (with curl_cffi browser impersonation when available), then a headless-Chrome player-data reader that now works for any host, and finally a direct ffmpeg copy. A failure message always names the last stage that was tried.
 - If a RedTube (or another Aylo site) download reports that the site "has disabled access from <region> (regional age-verification requirements) and served its age-verification wall/homepage instead of the requested video", the site redirected this network to its age wall. The real video page and its HD streams are unavailable from that region, and the age-wall page only contains a low-quality promo clip; Fetcher refuses to download the promo. Change the network/VPN exit to a region where the site serves the full catalog and retry.

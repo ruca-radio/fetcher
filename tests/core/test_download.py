@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from fetcher_core import download
+from fetcher_core import download, provider_login
 from fetcher_core.models import DownloadJob, DownloadPolicy, Video
 
 
@@ -317,7 +317,8 @@ def test_ffmpeg_fallback_sends_pornhub_age_cookies(monkeypatch, tmp_path):
     download._run_ffmpeg_fallback(job, ["https://cdn.test/a.mp4"], tmp_path, lambda: None)
 
     cmd = captured["cmd"]
-    assert cmd[cmd.index("-cookies") + 1] == download.PORNHUB_COOKIE_HEADER
+    assert cmd[cmd.index("-headers") + 1].startswith("Cookie: ")
+    assert download.PORNHUB_COOKIE_HEADER in cmd[cmd.index("-headers") + 1]
 
 
 def test_ffmpeg_fallback_omits_age_cookies_for_other_sites(monkeypatch, tmp_path):
@@ -332,7 +333,7 @@ def test_ffmpeg_fallback_omits_age_cookies_for_other_sites(monkeypatch, tmp_path
 
     download._run_ffmpeg_fallback(DownloadJob(video("Eporner", "e1")), ["https://cdn.test/a.mp4"], tmp_path, lambda: None)
 
-    assert "-cookies" not in captured["cmd"]
+    assert "-headers" not in captured["cmd"]
 
 
 def test_pornhub_browser_fallback_reports_age_gate_instead_of_no_media(monkeypatch):
@@ -368,9 +369,10 @@ def test_probe_remote_media_height_parses_stream_height(monkeypatch):
     monkeypatch.setattr(download.subprocess, "run", fake_run)
 
     assert download._probe_remote_media_height("https://cdn.test/a.m3u8", video("PornHub")) == 1080
-    assert "-cookies" in captured["cmd"]
+    assert "-headers" in captured["cmd"]
+    assert download.PORNHUB_COOKIE_HEADER in captured["cmd"][captured["cmd"].index("-headers") + 1]
     assert download._probe_remote_media_height("https://cdn.test/a.mp4", video("Eporner")) == 1080
-    assert "-cookies" not in captured["cmd"]
+    assert "-headers" not in captured["cmd"]
 
 
 @pytest.mark.parametrize("returncode,stdout,expected", [
@@ -818,6 +820,73 @@ def test_rejected_low_quality_file_is_not_downloaded_repeatedly(monkeypatch, tmp
     download.run_download(job, tmp_path / "tmp", tmp_path / "out", lambda: None, lambda j: None)
     assert len(attempts) == 1
     assert "480p" in job.eta
+
+
+def _store_session(monkeypatch, tmp_path, site: str) -> None:
+    monkeypatch.setattr(provider_login, "COOKIES_DIR", tmp_path / "cookies")
+    provider_login.save_cookies(
+        site,
+        [{"name": "sessid", "value": "abc", "domain": f".{site.lower()}.com", "path": "/", "secure": True}],
+    )
+
+
+def test_site_ytdlp_args_uses_stored_provider_session(monkeypatch, tmp_path):
+    _store_session(monkeypatch, tmp_path, "PornHub")
+
+    args = download._site_ytdlp_args(video("PornHub"))
+
+    assert args[0] == "--cookies"
+    cookie_path = Path(args[1])
+    assert cookie_path.exists()
+    assert ".pornhub.com\tTRUE\t/\tTRUE\t0\tsessid\tabc" in cookie_path.read_text(encoding="utf-8")
+    assert download._site_ytdlp_args(video("Eporner")) == []
+
+
+def test_ffmpeg_fallback_sends_stored_provider_session(monkeypatch, tmp_path):
+    _store_session(monkeypatch, tmp_path, "RedTube")
+    captured = {}
+
+    def fake_run(job, cmd, progress_cb, *, expected_dest=None):
+        captured["cmd"] = list(cmd)
+        return 0, expected_dest, deque()
+
+    monkeypatch.setattr(download, "FFMPEG", "/usr/bin/ffmpeg")
+    monkeypatch.setattr(download, "_run_download_process", fake_run)
+
+    download._run_ffmpeg_fallback(DownloadJob(video("RedTube", "rt1")), ["https://cdn.test/a.mp4"], tmp_path, lambda: None)
+
+    header = captured["cmd"][captured["cmd"].index("-headers") + 1]
+    assert "sessid=abc" in header
+
+
+def test_browser_fallback_seeds_stored_provider_session(monkeypatch, tmp_path):
+    _store_session(monkeypatch, tmp_path, "RedTube")
+    from selenium import webdriver
+
+    state = {"gets": [], "cookies": []}
+
+    class Browser:
+        page_source = "<html>real video page</html>"
+        current_url = "https://www.redtube.com/190684621"
+
+        def set_page_load_timeout(self, seconds): pass
+        def set_script_timeout(self, seconds): pass
+        def get(self, url): state["gets"].append(url)
+        def add_cookie(self, cookie): state["cookies"].append(cookie)
+        def execute_async_script(self, script):
+            return [{"quality": "1080", "videoUrl": "https://cdn.test/full.mp4"}]
+        def quit(self): pass
+
+    monkeypatch.setattr(webdriver, "Chrome", lambda **kwargs: Browser())
+    item = Video("190684621", "clip", 120, 0, "https://www.redtube.com/190684621", "RedTube")
+
+    urls, error = download._resolve_pornhub_browser_urls(item, min_height=720)
+
+    assert urls == ["https://cdn.test/full.mp4"]
+    assert error is None
+    assert state["gets"][0] == provider_login.SITE_HOME_URLS["RedTube"]
+    assert state["gets"][1] == item.url
+    assert state["cookies"][0]["name"] == "sessid"
 
 
 def test_impersonation_args_follow_curl_cffi_availability(monkeypatch) -> None:

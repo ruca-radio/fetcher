@@ -122,6 +122,39 @@ class StubSettings:
         return settings, dict(preferences)
 
 
+class StubLogin:
+    """In-memory stand-in for ``fetcher_core.provider_login``."""
+
+    SIGN_IN_SITES = ("PornHub", "RedTube", "xHamster")
+
+    def __init__(self, signed_in=()) -> None:
+        self.signed_in = set(signed_in)
+        self.calls: list[tuple[str, object]] = []
+        self.cleared: list[str] = []
+        self.thread_ids: list[int] = []
+
+    def is_signed_in(self, site: str) -> bool:
+        return site in self.signed_in
+
+    def cookie_count(self, site: str) -> int:
+        return 2 if site in self.signed_in else 0
+
+    def clear_cookies(self, site: str) -> bool:
+        self.cleared.append(site)
+        existed = site in self.signed_in
+        self.signed_in.discard(site)
+        return existed
+
+    def sign_in(self, site: str, *, cancel=None):
+        self.calls.append((site, cancel))
+        self.thread_ids.append(threading.get_ident())
+        self.signed_in.add(site)
+        return SimpleNamespace(
+            site=site, saved=True, cookie_count=2,
+            message=f"{site}: signed in; saved 2 session cookie(s).",
+        )
+
+
 class StubPlayer(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -923,6 +956,205 @@ def test_settings_diagnostics_saturation_is_visible_and_cleans_task_tracking(qtb
 
     assert "queue is full" in page.diagnostics_label.text().lower()
     assert page._tasks == set()
+
+
+def test_settings_provider_sign_ins_render_one_row_per_provider(qtbot) -> None:
+    login = StubLogin(signed_in=("PornHub",))
+    page = SettingsPage(StubSettings(), login_service=login, thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+
+    assert page.login_section_label.text() == "Provider sign-ins"
+    assert ".fetcher/cookies" in page.login_help_label.text()
+    assert "chrome" in page.login_help_label.text().lower()
+    assert "never shown" in page.login_help_label.text().lower()
+    assert list(page.login_rows) == ["PornHub", "RedTube", "xHamster"]
+    assert page.login_rows["PornHub"].name_label.text() == "PornHub"
+    assert page.login_rows["PornHub"].status_label.text() == "Signed in (2 cookies)"
+    assert page.login_rows["RedTube"].status_label.text() == "Not signed in"
+    assert page.login_rows["xHamster"].status_label.text() == "Not signed in"
+    assert page.login_rows["RedTube"].sign_in_button.text() == "Sign in"
+    assert page.login_rows["RedTube"].sign_out_button.text() == "Sign out"
+    assert page.login_rows["RedTube"].sign_in_button.accessibleName() == "Sign in to RedTube"
+
+
+def test_settings_provider_sign_in_runs_off_thread_and_updates_row(qtbot) -> None:
+    class BlockingLogin(StubLogin):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def sign_in(self, site, *, cancel=None):
+            self.calls.append((site, cancel))
+            self.thread_ids.append(threading.get_ident())
+            self.started.set()
+            self.release.wait(5)
+            self.signed_in.add(site)
+            return SimpleNamespace(
+                site=site, saved=True, cookie_count=2,
+                message=f"{site}: signed in; saved 2 session cookie(s).",
+            )
+
+    main_thread = threading.get_ident()
+    login = BlockingLogin()
+    page = SettingsPage(StubSettings(), login_service=login, thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    row = page.login_rows["PornHub"]
+    try:
+        row.sign_in_button.click()
+        qtbot.waitUntil(login.started.is_set, timeout=2_000)
+
+        assert login.thread_ids and login.thread_ids[0] != main_thread
+        assert row.status_label.text() == "Sign-in window open — log in, then close Chrome."
+        assert row.sign_in_button.text() == "Cancel sign-in"
+        assert not page.login_rows["RedTube"].sign_in_button.isEnabled()
+        assert not page.login_rows["xHamster"].sign_in_button.isEnabled()
+        assert page.login_rows["RedTube"].sign_out_button.isEnabled()
+        assert page.save_button.isEnabled()
+        assert page.diagnostics_button.isEnabled()
+        cancel = login.calls[0][1]
+        assert isinstance(cancel, threading.Event)
+        assert not cancel.is_set()
+    finally:
+        login.release.set()
+
+    qtbot.waitUntil(lambda: "signed in" in row.status_label.text().lower(), timeout=2_000)
+    qtbot.waitUntil(lambda: row.sign_in_button.text() == "Sign in", timeout=2_000)
+
+    assert "saved 2 session cookie" in row.status_label.text()
+    assert page.login_rows["RedTube"].sign_in_button.isEnabled()
+    assert page._active_signin_site is None
+
+
+def test_settings_provider_sign_in_cancels_with_the_button(qtbot) -> None:
+    class CancellableLogin(StubLogin):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+
+        def sign_in(self, site, *, cancel=None):
+            self.calls.append((site, cancel))
+            self.started.set()
+            cancel.wait(5)
+            return SimpleNamespace(
+                site=site, saved=False, cookie_count=0,
+                message=f"{site}: sign-in cancelled; nothing saved.",
+            )
+
+    login = CancellableLogin()
+    page = SettingsPage(StubSettings(), login_service=login, thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    row = page.login_rows["PornHub"]
+    row.sign_in_button.click()
+    qtbot.waitUntil(login.started.is_set, timeout=2_000)
+    try:
+        assert row.sign_in_button.text() == "Cancel sign-in"
+
+        row.sign_in_button.click()
+        qtbot.waitUntil(lambda: bool(login.calls) and login.calls[0][1].is_set(), timeout=2_000)
+        qtbot.waitUntil(lambda: "nothing saved" in row.status_label.text().lower(), timeout=2_000)
+    finally:
+        if login.calls:
+            login.calls[0][1].set()
+
+    qtbot.waitUntil(lambda: row.sign_in_button.text() == "Sign in", timeout=2_000)
+    assert page.login_rows["RedTube"].sign_in_button.isEnabled()
+
+
+def test_settings_provider_sign_out_clears_cookies_and_updates_label(qtbot) -> None:
+    login = StubLogin(signed_in=("RedTube",))
+    page = SettingsPage(StubSettings(), login_service=login, thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    row = page.login_rows["RedTube"]
+    assert row.status_label.text() == "Signed in (2 cookies)"
+
+    row.sign_out_button.click()
+
+    assert login.cleared == ["RedTube"]
+    assert row.status_label.text() == "Not signed in"
+    assert page.login_status_label.text() == "Signed out of RedTube."
+
+
+def test_settings_provider_sign_out_without_session_says_no_session(qtbot) -> None:
+    login = StubLogin()
+    page = SettingsPage(StubSettings(), login_service=login, thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+
+    page.login_rows["PornHub"].sign_out_button.click()
+
+    assert login.cleared == ["PornHub"]
+    assert page.login_status_label.text() == "PornHub: no stored session."
+
+
+def test_settings_provider_sign_in_error_is_surfaced_without_crashing(qtbot) -> None:
+    class FailingLogin(StubLogin):
+        def sign_in(self, site, *, cancel=None):
+            self.calls.append((site, cancel))
+            raise RuntimeError("chrome failed to start")
+
+    page = SettingsPage(StubSettings(), login_service=FailingLogin(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    row = page.login_rows["xHamster"]
+
+    row.sign_in_button.click()
+    qtbot.waitUntil(lambda: "chrome failed to start" in row.status_label.text(), timeout=2_000)
+    qtbot.waitUntil(lambda: row.sign_in_button.text() == "Sign in", timeout=2_000)
+
+    assert "failed" in row.status_label.text().lower()
+    assert "Traceback" not in row.status_label.text()
+    assert "Traceback" not in page.login_status_label.text()
+    assert page._active_signin_site is None
+    assert page.login_rows["PornHub"].sign_in_button.isEnabled()
+
+
+def test_settings_invalidate_cancels_active_provider_sign_in(qtbot) -> None:
+    class WaitingLogin(StubLogin):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+
+        def sign_in(self, site, *, cancel=None):
+            self.calls.append((site, cancel))
+            self.started.set()
+            cancel.wait(5)
+            return SimpleNamespace(
+                site=site, saved=False, cookie_count=0,
+                message=f"{site}: sign-in cancelled; nothing saved.",
+            )
+
+    login = WaitingLogin()
+    page = SettingsPage(StubSettings(), login_service=login, thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    row = page.login_rows["PornHub"]
+    row.sign_in_button.click()
+    qtbot.waitUntil(login.started.is_set, timeout=2_000)
+    try:
+        page.invalidate()
+
+        qtbot.waitUntil(lambda: bool(login.calls) and login.calls[0][1].is_set(), timeout=2_000)
+    finally:
+        if login.calls:
+            login.calls[0][1].set()
+    qtbot.waitUntil(lambda: page._active_signin_site is None, timeout=2_000)
+    assert row.sign_in_button.text() == "Sign in"
+
+
+def test_settings_provider_sign_ins_survive_service_without_optional_methods(qtbot) -> None:
+    class MinimalLogin:
+        SIGN_IN_SITES = ("PornHub",)
+
+        def sign_in(self, site, *, cancel=None):
+            return SimpleNamespace(site=site, saved=True, cookie_count=1,
+                                   message=f"{site}: signed in.")
+
+    page = SettingsPage(StubSettings(), login_service=MinimalLogin(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+
+    assert list(page.login_rows) == ["PornHub"]
+    assert page.login_rows["PornHub"].status_label.text() == "Status unavailable"
+
+    page.login_rows["PornHub"].sign_out_button.click()
+    assert "unavailable" in page.login_status_label.text().lower()
 
 
 def test_close_is_bounded_and_invalidates_background_work(qtbot) -> None:

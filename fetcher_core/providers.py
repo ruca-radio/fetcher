@@ -20,6 +20,7 @@ from fetcher_core.age_gate import (
     is_pornhub_sfw_page,
     pornhub_age_gate_message,
 )
+from fetcher_core import provider_login
 from fetcher_core.filters import dedupe_videos, video_matches_filters
 from fetcher_core.http import build_client
 from fetcher_core.models import AppSettings, STATE_DIR, SearchFilters, Video
@@ -177,6 +178,15 @@ def _solve_pornhub_key_challenge(text: str) -> Optional[str]:
 
     factor = _least_factor(p)
     return f"{factor}*{p // factor}:{s}:{tail_match.group(1)}:{tail_match.group(2)}"
+
+
+def _apply_site_session(client, site: str) -> None:
+    """Attach stored provider sign-in cookies to an HTTP client."""
+    try:
+        provider_login.apply_to_httpx(client, site)
+    except Exception:
+        # Test doubles or providers without a sign-in flow.
+        pass
 
 
 def _apply_pornhub_age_cookies(client) -> None:
@@ -387,6 +397,7 @@ def search_pornhub(query: str, min_s: int, max_s: int, pages: int) -> list[Video
     LAST_PROVIDER_WARNINGS.pop("PornHub", None)
     with build_client(timeout=20) as c:
         _apply_pornhub_age_cookies(c)
+        _apply_site_session(c, "PornHub")
         html_results = _search_pornhub_html(c, query, min_s, max_s, pages)
         if html_results or "PornHub" not in LAST_PROVIDER_ERRORS:
             return html_results
@@ -461,6 +472,7 @@ def search_xhamster(query: str, min_s: int, max_s: int, pages: int) -> list[Vide
     skipped_blurred = 0
     slug = re.sub(r"\s+", "-", query.strip())
     with build_client(timeout=20, follow_redirects=True) as c:
+        _apply_site_session(c, "xHamster")
         for page in range(1, pages + 1):
             url = f"https://xhamster.com/search/{slug}" + (f"?page={page}" if page > 1 else "")
             try:
@@ -504,6 +516,7 @@ def search_xhamster(query: str, min_s: int, max_s: int, pages: int) -> list[Vide
 def search_redtube(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
     out, seen = [], set()
     with build_client(timeout=20) as c:
+        _apply_site_session(c, "RedTube")
         for page in range(1, pages + 1):
             url = (f"https://api.redtube.com/?data=redtube.Videos.searchVideos"
                    f"&search={quote_plus(query)}&output=json&page={page}&limit=20"

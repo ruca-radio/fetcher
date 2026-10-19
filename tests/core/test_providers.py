@@ -714,3 +714,28 @@ def test_search_videos_all_sites_skips_searxng_when_disabled(monkeypatch):
     monkeypatch.setattr(providers, "search_searxng", _fail)
     settings = AppSettings(searxng_enabled=False)
     assert providers.search_videos("q", "All Sites", SearchFilters(), settings=settings) == []
+
+
+def test_pornhub_search_sends_stored_provider_session(monkeypatch, tmp_path):
+    from fetcher_core import provider_login
+
+    monkeypatch.setattr(provider_login, "COOKIES_DIR", tmp_path / "cookies")
+    provider_login.save_cookies(
+        "PornHub",
+        [{"name": "sessid", "value": "abc", "domain": ".pornhub.com", "path": "/"}],
+    )
+    seen_cookies: list[str] = []
+
+    def respond(request):
+        seen_cookies.append(request.headers.get("cookie", ""))
+        if request.url.path == "/webmasters/search":
+            return httpx.Response(503, text="API unavailable")
+        return httpx.Response(200, text='<ul id="videoSearchResult">' + _pornhub_card("phHit", "needle result") + '</ul>')
+
+    monkeypatch.setattr(providers, "LAST_PROVIDER_ERRORS", {})
+    monkeypatch.setattr(providers, "build_client", lambda **kwargs: httpx.Client(transport=httpx.MockTransport(respond)))
+
+    rows = providers.search_pornhub("needle", 0, 9999, 1)
+
+    assert [row.id for row in rows] == ["phHit"]
+    assert any("sessid=abc" in header for header in seen_cookies)

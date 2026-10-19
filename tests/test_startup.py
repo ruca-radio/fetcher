@@ -315,3 +315,211 @@ def test_cli_batch_min_height_zero_disables_the_floor(monkeypatch, tmp_path) -> 
 def test_cli_min_height_rejects_invalid_values(value) -> None:
     with pytest.raises(SystemExit):
         fetchtui.build_parser().parse_args(["download", "https://example.test/v", "--min-height", value])
+
+
+def test_cli_login_opens_browser_sign_in(monkeypatch, capsys) -> None:
+    calls = {}
+
+    class Result:
+        saved = True
+        message = "PornHub: signed in; saved 2 session cookie(s)."
+
+    def fake_sign_in(site, *, timeout_s=600, on_status=None, **kwargs):
+        calls["site"] = site
+        calls["timeout"] = timeout_s
+        if on_status is not None:
+            on_status("opening Chrome")
+        return Result()
+
+    monkeypatch.setattr(fetchtui.provider_login, "sign_in", fake_sign_in)
+    args = fetchtui.build_parser().parse_args(["login", "--site", "PornHub", "--timeout", "30"])
+
+    assert fetchtui.cli_login(args, fetchtui.AppSettings()) == 0
+    assert calls == {"site": "PornHub", "timeout": 30}
+    captured = capsys.readouterr()
+    assert "opening Chrome" in captured.err
+    assert "signed in" in captured.out
+
+
+def test_cli_login_failure_returns_nonzero(monkeypatch, capsys) -> None:
+    class Result:
+        saved = False
+        message = "PornHub: no session cookies were captured; nothing saved."
+
+    monkeypatch.setattr(fetchtui.provider_login, "sign_in", lambda *args, **kwargs: Result())
+    args = fetchtui.build_parser().parse_args(["login", "--site", "PornHub"])
+
+    assert fetchtui.cli_login(args, fetchtui.AppSettings()) == 1
+    assert "nothing saved" in capsys.readouterr().err
+
+
+def test_cli_logout_clears_stored_session(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(fetchtui.provider_login, "clear_cookies", lambda site: True)
+    args = fetchtui.build_parser().parse_args(["logout", "--site", "RedTube"])
+
+    assert fetchtui.cli_logout(args, fetchtui.AppSettings()) == 0
+    assert "session cleared" in capsys.readouterr().out
+
+
+def test_tui_settings_shows_provider_signin_status(monkeypatch) -> None:
+    class _StaticStub:
+        def __init__(self):
+            self.value = ""
+
+        def update(self, value):
+            self.value = value
+
+    class _ButtonStub:
+        def __init__(self):
+            self.disabled = None
+
+    class _AppStub:
+        def __init__(self):
+            self.widgets = {}
+            for site in fetchtui.provider_login.SIGN_IN_SITES:
+                slug = site.lower()
+                self.widgets[f"#settings-signin-{slug}"] = _StaticStub()
+                self.widgets[f"#btn-signout-{slug}"] = _ButtonStub()
+
+        def query_one(self, selector, *args, **kwargs):
+            return self.widgets[selector]
+
+    monkeypatch.setattr(
+        fetchtui.provider_login, "cookie_count",
+        lambda site: 3 if site == "PornHub" else 0,
+    )
+    app = _AppStub()
+
+    fetchtui.FetchTUI._refresh_provider_signin_status(app)
+
+    assert app.widgets["#settings-signin-pornhub"].value == "Signed in (3 cookies)"
+    assert app.widgets["#btn-signout-pornhub"].disabled is False
+    assert app.widgets["#settings-signin-redtube"].value == "Not signed in"
+    assert app.widgets["#btn-signout-redtube"].disabled is True
+
+
+def test_tui_provider_signin_finished_resets_controls(monkeypatch) -> None:
+    class _StaticStub:
+        def __init__(self):
+            self.value = ""
+
+        def update(self, value):
+            self.value = value
+
+    class _ButtonStub:
+        def __init__(self):
+            self.label = "x"
+            self.disabled = None
+
+    class _AppStub:
+        def __init__(self):
+            self.widgets = {}
+            for site in fetchtui.provider_login.SIGN_IN_SITES:
+                slug = site.lower()
+                self.widgets[f"#settings-signin-{slug}"] = _StaticStub()
+                self.widgets[f"#btn-signin-{slug}"] = _ButtonStub()
+                self.widgets[f"#btn-signout-{slug}"] = _ButtonStub()
+            self.statuses = []
+            self.logs = []
+            self._signin_site = "PornHub"
+            self._signin_cancel = None
+
+        def query_one(self, selector, *args, **kwargs):
+            return self.widgets[selector]
+
+        def _set_settings_status(self, message):
+            self.statuses.append(message)
+
+        def _log(self, message):
+            self.logs.append(message)
+
+        def _refresh_provider_signin_status(self):
+            return fetchtui.FetchTUI._refresh_provider_signin_status(self)
+
+        def _provider_signin_buttons(self):
+            return fetchtui.FetchTUI._provider_signin_buttons(self)
+
+    monkeypatch.setattr(fetchtui.provider_login, "cookie_count", lambda site: 4 if site == "PornHub" else 0)
+    app = _AppStub()
+    result = SimpleNamespace(message="PornHub: signed in; saved 4 session cookie(s).")
+
+    fetchtui.FetchTUI._provider_signin_finished(app, result)
+
+    assert app._signin_site is None
+    assert all(app.widgets[f"#btn-signin-{site.lower()}"].label == "Sign in" for site in fetchtui.provider_login.SIGN_IN_SITES)
+    assert app.widgets["#settings-signin-pornhub"].value == "Signed in (4 cookies)"
+    assert app.statuses == ["PornHub: signed in; saved 4 session cookie(s)."]
+    assert app.logs == ["PornHub: signed in; saved 4 session cookie(s)."]
+
+
+def test_tui_provider_signout_clears_session(monkeypatch) -> None:
+    class _StaticStub:
+        def __init__(self):
+            self.value = "Signed in (2 cookies)"
+
+        def update(self, value):
+            self.value = value
+
+    class _ButtonStub:
+        def __init__(self):
+            self.label = "Sign in"
+            self.disabled = None
+
+    class _AppStub:
+        def __init__(self):
+            self.widgets = {}
+            for site in fetchtui.provider_login.SIGN_IN_SITES:
+                slug = site.lower()
+                self.widgets[f"#settings-signin-{slug}"] = _StaticStub()
+                self.widgets[f"#btn-signin-{slug}"] = _ButtonStub()
+                self.widgets[f"#btn-signout-{slug}"] = _ButtonStub()
+            self.statuses = []
+            self.logs = []
+
+        def query_one(self, selector, *args, **kwargs):
+            return self.widgets[selector]
+
+        def _set_settings_status(self, message):
+            self.statuses.append(message)
+
+        def _log(self, message):
+            self.logs.append(message)
+
+        def _refresh_provider_signin_status(self):
+            return fetchtui.FetchTUI._refresh_provider_signin_status(self)
+
+        def _provider_signin_buttons(self):
+            return fetchtui.FetchTUI._provider_signin_buttons(self)
+
+    monkeypatch.setattr(fetchtui.provider_login, "cookie_count", lambda site: 0)
+    monkeypatch.setattr(fetchtui.provider_login, "clear_cookies", lambda site: True)
+    app = _AppStub()
+
+    fetchtui.FetchTUI._signout_provider(app, "RedTube")
+
+    assert app.statuses == ["RedTube: session cleared."]
+    assert app.logs == ["RedTube: session cleared."]
+    assert app.widgets["#settings-signin-redtube"].value == "Not signed in"
+    assert app.widgets["#btn-signout-redtube"].disabled is True
+
+
+def test_cli_logout_survives_corrupt_cookie_directory(monkeypatch, tmp_path, capsys) -> None:
+    from fetcher_core import provider_login
+
+    monkeypatch.setattr(provider_login, "COOKIES_DIR", tmp_path / "cookies")
+    provider_login.cookie_path("PornHub").mkdir(parents=True)
+    args = fetchtui.build_parser().parse_args(["logout", "--site", "PornHub"])
+
+    assert fetchtui.cli_logout(args, fetchtui.AppSettings()) == 0
+    assert "session cleared" in capsys.readouterr().out
+
+
+def test_cli_login_reports_start_failure_without_traceback(monkeypatch, capsys) -> None:
+    def explode(*args, **kwargs):
+        raise RuntimeError("chrome missing")
+
+    monkeypatch.setattr(fetchtui.provider_login, "sign_in", explode)
+    args = fetchtui.build_parser().parse_args(["login", "--site", "PornHub"])
+
+    assert fetchtui.cli_login(args, fetchtui.AppSettings()) == 1
+    assert "sign-in failed" in capsys.readouterr().err
