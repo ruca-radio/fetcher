@@ -154,12 +154,20 @@ _FAR_FUTURE_EXPIRY = 2147483647
 
 
 def _twitter_cookie_args() -> list[str]:
-    """Use the stored Twitter cookie file when available, else Chrome's jar.
-
-    Importing TWITTER_COOKIES from fetcher_core.providers would work (providers
-    does not import this module) but drags the HTTP stack in, so derive the
-    path from STATE_DIR directly.
-    """
+    """Prefer a Settings sign-in session, then the legacy cookie file, then Chrome."""
+    try:
+        provider_session = (
+            provider_login.is_signed_in("Twitter")
+            and provider_login.has_cookie("Twitter", "auth_token")
+        )
+        stored = provider_login.netscape_cookie_file("Twitter") if provider_session else None
+    except Exception:
+        stored = None
+    if stored is not None:
+        return ["--cookies", str(stored)]
+    # Importing TWITTER_COOKIES from fetcher_core.providers would work (providers
+    # does not import this module) but drags the HTTP stack in, so derive the
+    # path from STATE_DIR directly.
     try:
         data = json.loads(TWITTER_COOKIES_JSON.read_text(encoding="utf-8"))
     except (OSError, ValueError):

@@ -24,12 +24,12 @@ from fetcher_core.models import AppSettings
 
 from .workers import Task
 
-_DEFAULT_SIGN_IN_SITES: tuple[str, ...] = ("PornHub", "RedTube", "xHamster")
+_DEFAULT_SIGN_IN_SITES: tuple[str, ...] = ("PornHub", "RedTube", "xHamster", "Twitter")
 _ACTIVE_SIGN_IN_STATUS = "Sign-in window open — log in, then close Chrome."
 _LOGIN_HELP_TEXT = (
     "Sign-in opens a Chrome window on the provider's login page. Log in there, then close "
     "the window; Fetcher saves the session cookies (owner-only, under .fetcher/cookies). "
-    "Cookie values are never shown."
+    "Cookie values are never shown. Test checks whether a stored session is still logged in."
 )
 
 
@@ -41,6 +41,7 @@ class ProviderSignInRow:
     name_label: QLabel
     status_label: QLabel
     sign_in_button: QPushButton
+    test_button: QPushButton
     sign_out_button: QPushButton
     container: QWidget
 
@@ -293,28 +294,43 @@ class SettingsPage(QWidget):
         sign_in_button = QPushButton("Sign in", self)
         sign_in_button.setAccessibleName(f"Sign in to {site}")
         sign_in_button.setToolTip(f"Open a Chrome window to sign in to {site}.")
+        test_button = QPushButton("Test", self)
+        test_button.setAccessibleName(f"Test the {site} session")
+        test_button.setToolTip(f"Check whether the saved {site} session is still logged in.")
         sign_out_button = QPushButton("Sign out", self)
         sign_out_button.setAccessibleName(f"Sign out of {site}")
         sign_out_button.setToolTip(f"Forget the saved {site} session cookies.")
         controls = QHBoxLayout()
         controls.addWidget(status_label, 1)
         controls.addWidget(sign_in_button)
+        controls.addWidget(test_button)
         controls.addWidget(sign_out_button)
         container = QWidget(self)
         container.setLayout(controls)
         sign_in_button.clicked.connect(lambda _checked=False, site=site: self.sign_in(site))
+        test_button.clicked.connect(lambda _checked=False, site=site: self.test_session(site))
         sign_out_button.clicked.connect(lambda _checked=False, site=site: self.sign_out(site))
         return ProviderSignInRow(
             site=site,
             name_label=name_label,
             status_label=status_label,
             sign_in_button=sign_in_button,
+            test_button=test_button,
             sign_out_button=sign_out_button,
             container=container,
         )
 
     def _login_status_text(self, site: str) -> str:
         service = self.login_service
+        if site == "Twitter":
+            authenticated = getattr(service, "twitter_authenticated", None)
+            count_cookies = getattr(service, "cookie_count", None)
+            if callable(authenticated) and callable(count_cookies):
+                try:
+                    if authenticated() and count_cookies(site) == 0:
+                        return "Signed in via legacy cookie file"
+                except Exception:
+                    pass
         try:
             is_signed_in = getattr(service, "is_signed_in", None)
             count_cookies = getattr(service, "cookie_count", None)
@@ -435,6 +451,66 @@ class SettingsPage(QWidget):
         active_site = self._active_signin_site
         self.refresh_login_statuses(skip=(active_site,) if active_site is not None else ())
 
+    def test_session(self, site: str) -> None:
+        """Probe one stored session in the background and show the result."""
+        row = self.login_rows.get(site)
+        if row is None:
+            return
+        test = getattr(self.login_service, "test_session", None)
+        if test is None:
+            message = f"{site}: session testing is unavailable."
+            row.status_label.setText(message)
+            self.login_status_label.setText(message)
+            return
+        if getattr(self, "_testing_site", None) is not None:
+            return
+        self._testing_site = site
+        row.status_label.setText(f"{site}: checking session…")
+        self.login_status_label.setText(f"{site}: checking the stored session…")
+        row.test_button.setEnabled(False)
+        task = Task(self._run_test_session, site)
+        task.signals.result.connect(lambda result, site=site: self._test_completed(site, result))
+        task.signals.error.connect(lambda error, site=site: self._test_failed(site, error))
+        task.signals.finished.connect(lambda site=site, task=task: self._test_finished(site, task))
+        self._tasks.add(task)
+        try:
+            self.thread_pool.start(task)
+        except Exception as exc:
+            task.cancel()
+            self._tasks.discard(task)
+            self._testing_site = None
+            row.test_button.setEnabled(self._submissions_enabled)
+            message = f"{site}: session test could not start: {exc}"
+            row.status_label.setText(message)
+            self.login_status_label.setText(message)
+
+    def _run_test_session(self, site: str):
+        return self.login_service.test_session(site)
+
+    def _test_completed(self, site: str, result) -> None:
+        message = str(getattr(result, "message", "") or f"{site}: session test finished.")
+        row = self.login_rows.get(site)
+        if row is not None:
+            row.status_label.setText(message)
+            row.test_button.setEnabled(self._submissions_enabled)
+        self.login_status_label.setText(message)
+
+    def _test_failed(self, site: str, error) -> None:
+        exception = error[1] if isinstance(error, tuple) and len(error) > 1 else error
+        message = f"{site}: session test failed — {exception}"
+        row = self.login_rows.get(site)
+        if row is not None:
+            row.status_label.setText(message)
+        self.login_status_label.setText(message)
+
+    def _test_finished(self, site: str, task: Task) -> None:
+        self._tasks.discard(task)
+        if getattr(self, "_testing_site", None) == site:
+            self._testing_site = None
+        row = self.login_rows.get(site)
+        if row is not None:
+            row.test_button.setEnabled(self._submissions_enabled)
+
     def _update_sign_in_controls(self) -> None:
         active = self._active_signin_site
         for site, row in self.login_rows.items():
@@ -446,6 +522,7 @@ class SettingsPage(QWidget):
                 row.sign_in_button.setText("Sign in")
                 row.sign_in_button.setAccessibleName(f"Sign in to {site}")
                 row.sign_in_button.setEnabled(self._submissions_enabled and active is None)
+            row.test_button.setEnabled(self._submissions_enabled)
             row.sign_out_button.setEnabled(self._submissions_enabled)
 
     def invalidate(self) -> None:

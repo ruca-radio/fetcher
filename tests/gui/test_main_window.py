@@ -125,7 +125,7 @@ class StubSettings:
 class StubLogin:
     """In-memory stand-in for ``fetcher_core.provider_login``."""
 
-    SIGN_IN_SITES = ("PornHub", "RedTube", "xHamster")
+    SIGN_IN_SITES = ("PornHub", "RedTube", "xHamster", "Twitter")
 
     def __init__(self, signed_in=()) -> None:
         self.signed_in = set(signed_in)
@@ -152,6 +152,17 @@ class StubLogin:
         return SimpleNamespace(
             site=site, saved=True, cookie_count=2,
             message=f"{site}: signed in; saved 2 session cookie(s).",
+        )
+
+    def test_session(self, site: str):
+        valid = site in self.signed_in
+        return SimpleNamespace(
+            site=site,
+            status="valid" if valid else "missing",
+            message=(
+                f"{site}: the stored session is logged in." if valid
+                else f"{site}: no stored session; sign in first."
+            ),
         )
 
 
@@ -967,7 +978,7 @@ def test_settings_provider_sign_ins_render_one_row_per_provider(qtbot) -> None:
     assert ".fetcher/cookies" in page.login_help_label.text()
     assert "chrome" in page.login_help_label.text().lower()
     assert "never shown" in page.login_help_label.text().lower()
-    assert list(page.login_rows) == ["PornHub", "RedTube", "xHamster"]
+    assert list(page.login_rows) == ["PornHub", "RedTube", "xHamster", "Twitter"]
     assert page.login_rows["PornHub"].name_label.text() == "PornHub"
     assert page.login_rows["PornHub"].status_label.text() == "Signed in (2 cookies)"
     assert page.login_rows["RedTube"].status_label.text() == "Not signed in"
@@ -975,6 +986,7 @@ def test_settings_provider_sign_ins_render_one_row_per_provider(qtbot) -> None:
     assert page.login_rows["RedTube"].sign_in_button.text() == "Sign in"
     assert page.login_rows["RedTube"].sign_out_button.text() == "Sign out"
     assert page.login_rows["RedTube"].sign_in_button.accessibleName() == "Sign in to RedTube"
+    assert page.login_rows["Twitter"].status_label.text() == "Not signed in"
 
 
 def test_settings_provider_sign_in_runs_off_thread_and_updates_row(qtbot) -> None:
@@ -1073,6 +1085,31 @@ def test_settings_provider_sign_out_clears_cookies_and_updates_label(qtbot) -> N
     assert login.cleared == ["RedTube"]
     assert row.status_label.text() == "Not signed in"
     assert page.login_status_label.text() == "Signed out of RedTube."
+
+
+def test_settings_provider_session_test_button_updates_status(qtbot) -> None:
+    login = StubLogin(signed_in=("PornHub",))
+    page = SettingsPage(StubSettings(), login_service=login, thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    row = page.login_rows["PornHub"]
+
+    row.test_button.click()
+    qtbot.waitUntil(lambda: "stored session is logged in" in row.status_label.text(), timeout=2_000)
+
+    assert page.login_status_label.text() == "PornHub: the stored session is logged in."
+    assert row.test_button.isEnabled()
+
+
+def test_settings_provider_session_test_without_session_is_quick(qtbot) -> None:
+    login = StubLogin()
+    page = SettingsPage(StubSettings(), login_service=login, thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    row = page.login_rows["RedTube"]
+
+    row.test_button.click()
+    qtbot.waitUntil(lambda: "no stored session" in row.status_label.text(), timeout=2_000)
+
+    assert page.login_status_label.text() == "RedTube: no stored session; sign in first."
 
 
 def test_settings_provider_sign_out_without_session_says_no_session(qtbot) -> None:

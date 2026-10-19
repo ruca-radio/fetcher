@@ -788,26 +788,35 @@ def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
 
     _clear_provider_error("Twitter")
 
-    # Load auth_token from cookies file
+    # Prefer the Settings browser sign-in session; the legacy auth_token file
+    # remains supported for users who imported it manually.
+    stored_cookies = provider_login.load_cookies("Twitter") if provider_login.is_signed_in("Twitter") else []
+    stored_auth_token = next(
+        (str(cookie["value"]) for cookie in stored_cookies if cookie.get("name") == "auth_token"),
+        "",
+    )
+    legacy: dict = {}
     if cookies_file.exists():
         try:
-            cdata = json.loads(cookies_file.read_text())
-            auth_token = cdata.get("auth_token", "")
+            payload = json.loads(cookies_file.read_text())
+            legacy = payload if isinstance(payload, dict) else {}
         except Exception as exc:
-            _record_provider_error("Twitter", f"unreadable Twitter cookie file: {exc}")
-            return []
-    else:
-        _record_provider_error(
-            "Twitter",
-            "no Twitter cookies; run extract_twitter_cookies.py or log in through the TUI",
-        )
-        return []
-
+            if not stored_cookies:
+                _record_provider_error("Twitter", f"unreadable Twitter cookie file: {exc}")
+                return []
+    auth_token = stored_auth_token or str(legacy.get("auth_token") or "")
     if not auth_token:
-        _record_provider_error(
-            "Twitter",
-            "stored Twitter cookies have no auth_token; re-authenticate",
-        )
+        if not stored_cookies and not cookies_file.exists():
+            _record_provider_error(
+                "Twitter",
+                "no Twitter session; use Settings → Provider Sign-ins → Twitter, "
+                "or run extract_twitter_cookies.py",
+            )
+        else:
+            _record_provider_error(
+                "Twitter",
+                "stored Twitter session has no auth_token; sign in again",
+            )
         return []
 
     opts = Options()
@@ -823,13 +832,18 @@ def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
 
     try:
         driver = webdriver.Chrome(options=opts)
-        # Set auth cookie
         driver.get("https://x.com")
         _time.sleep(2)
-        driver.add_cookie({
-            "name": "auth_token", "value": auth_token,
-            "domain": ".x.com", "path": "/",
-        })
+        if stored_cookies:
+            provider_login.apply_to_selenium(driver, "Twitter")
+        if not stored_auth_token:
+            driver.add_cookie({
+                "name": "auth_token", "value": auth_token,
+                "domain": ".x.com", "path": "/",
+            })
+            ct0 = str(legacy.get("ct0") or "")
+            if ct0:
+                driver.add_cookie({"name": "ct0", "value": ct0, "domain": ".x.com", "path": "/"})
 
         # Search media tab
         from urllib.parse import quote_plus as _qp

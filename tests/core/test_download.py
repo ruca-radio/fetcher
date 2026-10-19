@@ -13,6 +13,11 @@ from fetcher_core import download, provider_login
 from fetcher_core.models import DownloadJob, DownloadPolicy, Video
 
 
+@pytest.fixture(autouse=True)
+def _isolated_provider_cookies(tmp_path, monkeypatch):
+    monkeypatch.setattr(provider_login, "COOKIES_DIR", tmp_path / "isolated-provider-cookies")
+
+
 def video(site: str = "Eporner", identifier: str = "abc123") -> Video:
     return Video(identifier, "A / Bad: Title?!", 120, 0, f"https://example.test/watch/{identifier}", site)
 
@@ -1082,3 +1087,32 @@ def test_run_download_o_flag_last_token_does_not_crash_progress_dir(monkeypatch)
     returncode, dest, tail = download._run_download_process(job, ["yt-dlp", "-o"], lambda: None)
     assert returncode == 0
     assert job.progress == 50.0
+
+
+def test_twitter_cookie_args_prefers_provider_session(monkeypatch) -> None:
+    provider_login.save_cookies(
+        "Twitter",
+        [{"name": "auth_token", "value": "tok", "domain": ".x.com", "path": "/"}],
+    )
+
+    args = download._twitter_cookie_args()
+
+    assert args[0] == "--cookies"
+    written = Path(args[1]).read_text(encoding="utf-8")
+    assert ".x.com\tTRUE\t/\tFALSE\t0\tauth_token\ttok" in written
+
+
+def test_twitter_cookie_args_ignores_provider_cookies_without_auth_token(monkeypatch, tmp_path):
+    provider_login.save_cookies(
+        "Twitter",
+        [{"name": "guest_id", "value": "anon", "domain": ".x.com", "path": "/"}],
+    )
+    legacy = tmp_path / "twitter_cookies.json"
+    legacy.write_text(json.dumps({"auth_token": "LEGACYTOK"}), encoding="utf-8")
+    monkeypatch.setattr(download, "TWITTER_COOKIES_JSON", legacy)
+    monkeypatch.setattr(download, "TWITTER_COOKIES_NETSCAPE", tmp_path / "legacy.net.txt")
+
+    args = download._twitter_cookie_args()
+
+    assert args[0] == "--cookies"
+    assert "LEGACYTOK" in Path(args[1]).read_text(encoding="utf-8")

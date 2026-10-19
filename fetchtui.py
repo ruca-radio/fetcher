@@ -178,14 +178,6 @@ def save_settings(settings: AppSettings) -> None:
     store.save(settings)
 
 
-def _write_private_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(payload, f, indent=2)
-    os.chmod(path, 0o600)
-
-
 def load_downloaded(plex_dir: Path) -> tuple[set[str], set[str]]:
     """Return (video_ids, normalized_titles) of already-downloaded content."""
     ids: set[str] = set()
@@ -449,60 +441,6 @@ class QuitScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-# ── Twitter login modal ──────────────────────────────────────────────────────
-class TwitterLoginScreen(ModalScreen[str]):
-    BINDINGS = [Binding("escape", "dismiss_cancel", "Cancel")]
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="tw-login-box"):
-            yield Static(
-                "[bold cyan]Twitter/X Auth[/]\n\n"
-                "Paste your [bold]auth_token[/] from Chrome DevTools:\n"
-                "  F12 → Application → Cookies → x.com → auth_token\n\n"
-                "Or paste full cookies JSON:\n"
-                '  [dim]{"auth_token":"abc…"}[/]\n',
-                markup=True,
-            )
-            yield Label("auth_token (or JSON):")
-            yield Input(placeholder="49be93f66eafc…  or  {\"auth_token\":\"…\"}", id="tw-token")
-            yield Static("", id="tw-login-status")
-            with Horizontal(id="tw-login-buttons"):
-                yield Button("Save", variant="primary", name="save")
-                yield Button("Cancel", variant="default", name="cancel")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.name == "cancel":
-            self.dismiss("")
-        elif event.button.name == "save":
-            raw = self.query_one("#tw-token", Input).value.strip()
-            if not raw:
-                self.query_one("#tw-login-status", Static).update("[red]Paste a token[/]")
-                return
-
-            # Try as JSON first
-            if raw.startswith("{"):
-                try:
-                    cookies = json.loads(raw)
-                    if not isinstance(cookies, dict) or "auth_token" not in cookies:
-                        raise ValueError("JSON must contain auth_token key")
-                    _write_private_json(TWITTER_COOKIES, cookies)
-                    self.dismiss("Cookies saved.")
-                    return
-                except (json.JSONDecodeError, ValueError) as e:
-                    self.query_one("#tw-login-status", Static).update(f"[red]{e}[/]")
-                    return
-
-            # Treat as raw auth_token value
-            if len(raw) < 20:
-                self.query_one("#tw-login-status", Static).update("[red]Token too short[/]")
-                return
-            _write_private_json(TWITTER_COOKIES, {"auth_token": raw})
-            self.dismiss("auth_token saved.")
-
-    def action_dismiss_cancel(self) -> None:
-        self.dismiss("")
-
-
 class SearchFilterScreen(ModalScreen[Optional[SearchFilters]]):
     BINDINGS = [Binding("escape", "dismiss_cancel", "Cancel")]
 
@@ -759,6 +697,7 @@ class FetchTUI(App):
     }
     .settings-hint { color: $text-muted; height: auto; margin: 0 0 1 0; }
     #settings-scroll .provider-signin { min-width: 9; margin: 0 1 0 0; }
+    #settings-scroll .provider-test { min-width: 6; margin: 0 1 0 0; }
     #settings-actions { height: auto; }
     #settings-actions Button { margin: 0 1 0 0; }
     #settings-status { color: $text-muted; }
@@ -784,15 +723,6 @@ class FetchTUI(App):
     }
     #quit-buttons { height: auto; }
     #quit-buttons Button { margin: 1 2; }
-
-    #tw-login-box {
-        width: 50; height: auto;
-        border: solid cyan; background: $panel;
-        padding: 2 4; margin: 6 12;
-    }
-    #tw-cookies { width: 1fr; }
-    #tw-login-buttons { height: auto; }
-    #tw-login-buttons Button { margin: 1 2; }
 
     #filter-box {
         width: 56; height: auto;
@@ -840,7 +770,7 @@ class FetchTUI(App):
         # Twitter tab state
         self._tw_results: list[Video] = []
         self._tw_dl_count: int = 0
-        self._tw_logged_in: bool = TWITTER_COOKIES.exists()
+        self._tw_logged_in: bool = provider_login.twitter_authenticated()
         self._tw_sort_key: SortKey = "views"
         self._tw_sort_reverse: bool = True
 
@@ -980,6 +910,11 @@ class FetchTUI(App):
                                     classes="provider-signin",
                                 )
                                 yield Button(
+                                    "Test",
+                                    id=f"btn-test-{_signin_site.lower()}",
+                                    classes="provider-test",
+                                )
+                                yield Button(
                                     "Sign out",
                                     id=f"btn-signout-{_signin_site.lower()}",
                                     classes="provider-signin",
@@ -1014,7 +949,7 @@ class FetchTUI(App):
         if self._tw_logged_in:
             self._log("Twitter: cookies loaded.")
         else:
-            self._log("Twitter: not logged in — click Login to authenticate.")
+            self._log("Twitter: not logged in — click Login for browser sign-in.")
 
         moved, deleted = cleanup_tmp(self._tmp_dir, self._plex_dir)
         if moved or deleted:
@@ -1495,19 +1430,57 @@ class FetchTUI(App):
 
     @on(Button.Pressed, "#tw-btn-login")
     def _tw_login_btn(self) -> None:
-        self.push_screen(TwitterLoginScreen(), self._tw_login_callback)
+        if getattr(self, "_tw_signin_active", False):
+            cancel = getattr(self, "_tw_signin_cancel", None)
+            if cancel is not None:
+                cancel.set()
+                self._tw_signin_status("Twitter: cancelling sign-in…")
+                self._log("Twitter: cancelling sign-in…")
+            return
+        self._tw_signin_active = True
+        self._tw_signin_cancel = threading.Event()
+        try:
+            button = self.query_one("#tw-btn-login", Button)
+            button.label = "Cancel sign-in"
+            button.variant = "warning"
+            self.query_one("#tw-login-status", Static).update("Opening Chrome for X/Twitter sign-in…")
+        except Exception:
+            pass
+        self._tw_signin_worker(self._tw_signin_cancel)
 
-    def _tw_login_callback(self, result: Optional[str]) -> None:
-        if result:
-            self._log(f"Twitter: {result}")
-            self._tw_logged_in = TWITTER_COOKIES.exists()
+    @work(thread=True)
+    def _tw_signin_worker(self, cancel: threading.Event) -> None:
+        try:
+            result = provider_login.sign_in(
+                "Twitter",
+                cancel=cancel,
+                on_status=lambda message: self.call_from_thread(self._tw_signin_status, message),
+            )
+        except Exception as exc:
+            result = provider_login.SignInResult(
+                "Twitter", False, 0, f"Twitter: sign-in failed ({exc.__class__.__name__}: {exc}).",
+            )
+        self.call_from_thread(self._tw_signin_finished, result)
+
+    def _tw_signin_status(self, message: str) -> None:
+        try:
+            self.query_one("#tw-login-status", Static).update(message)
+        except Exception:
+            pass
+
+    def _tw_signin_finished(self, result) -> None:
+        self._tw_signin_active = False
+        self._tw_signin_cancel = None
+        self._tw_logged_in = provider_login.twitter_authenticated()
+        try:
             btn = self.query_one("#tw-btn-login", Button)
-            if self._tw_logged_in:
-                btn.label = "✓ Logged in"
-                btn.variant = "success"
-            else:
-                btn.label = "Login"
-                btn.variant = "warning"
+            btn.disabled = False
+            btn.label = "✓ Logged in" if self._tw_logged_in else "Login"
+            btn.variant = "success" if self._tw_logged_in else "warning"
+            self.query_one("#tw-login-status", Static).update(getattr(result, "message", ""))
+        except Exception:
+            pass
+        self._log(getattr(result, "message", "Twitter: sign-in finished."))
 
     @on(Button.Pressed, "#tw-btn-search")
     def _tw_btn(self) -> None:
@@ -1519,8 +1492,8 @@ class FetchTUI(App):
 
     def _tw_do_search(self) -> None:
         if not self._tw_logged_in:
-            self._log("Twitter: login required first.")
-            self.push_screen(TwitterLoginScreen(), self._tw_login_callback)
+            self._log("Twitter: sign in first — opening the browser sign-in window.")
+            self._tw_login_btn()
             return
 
         query = self.query_one("#tw-search-input", Input).value.strip()
@@ -1872,6 +1845,34 @@ class FetchTUI(App):
                 event.stop()
                 return
 
+    @on(Button.Pressed, "Button.provider-test")
+    def _provider_test_button(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        for site in provider_login.SIGN_IN_SITES:
+            if button_id == f"btn-test-{site.lower()}":
+                self._set_settings_status(f"{site}: checking the stored session…")
+                self._provider_session_test_worker(site)
+                event.stop()
+                return
+
+    @work(thread=True)
+    def _provider_session_test_worker(self, site: str) -> None:
+        try:
+            check = provider_login.test_session(site)
+        except Exception as exc:
+            check = provider_login.SessionCheck(
+                site, "unknown", f"{site}: session check failed ({exc.__class__.__name__}: {exc}).",
+            )
+        self.call_from_thread(self._provider_session_test_finished, check)
+
+    def _provider_session_test_finished(self, check) -> None:
+        try:
+            self.query_one(f"#settings-signin-{check.site.lower()}", Static).update(check.message)
+        except Exception:
+            pass
+        self._set_settings_status(check.message)
+        self._log(check.message)
+
     @on(Button.Pressed, "#btn-settings-save")
     def _settings_save_btn(self) -> None:
         theme = str(self.query_one("#settings-theme", Select).value or self.settings.theme)
@@ -2206,6 +2207,12 @@ def build_parser() -> ArgumentParser:
     logout = sub.add_parser("logout", help="Forget a stored provider session")
     logout.add_argument("--site", choices=list(provider_login.SIGN_IN_SITES), required=True)
 
+    status = sub.add_parser("session-status", help="Check whether stored provider sessions are logged in")
+    status.add_argument(
+        "--site", choices=list(provider_login.SIGN_IN_SITES), action="append", dest="sites",
+        help="Provider to check (repeatable); defaults to every supported provider",
+    )
+
     return parser
 
 
@@ -2321,6 +2328,22 @@ def cli_logout(args: Namespace, settings: AppSettings) -> int:
     return 0
 
 
+def cli_session_status(args: Namespace, settings: AppSettings) -> int:
+    sites = list(getattr(args, "sites", None) or provider_login.SIGN_IN_SITES)
+    exit_code = 0
+    for site in sites:
+        try:
+            check = provider_login.test_session(site)
+        except Exception as exc:
+            check = provider_login.SessionCheck(
+                site, "unknown", f"{site}: session check failed ({exc.__class__.__name__}: {exc}).",
+            )
+        print(check.message)
+        if check.status != "valid":
+            exit_code = 1
+    return exit_code
+
+
 def _run_gui(argv: Optional[list[str]] = None) -> int:
     _harden_state()
     from fetcher_gui.app import run_gui
@@ -2371,6 +2394,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cli_login(args, settings)
     if args.command == "logout":
         return cli_logout(args, settings)
+    if args.command == "session-status":
+        return cli_session_status(args, settings)
 
     parser.print_help()
     return 1

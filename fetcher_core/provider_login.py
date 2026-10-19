@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -24,28 +25,34 @@ from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
+from .age_gate import is_age_wall_page, is_pornhub_sfw_page
+from .http import build_client
 from .models import STATE_DIR
 
 COOKIES_DIR = STATE_DIR / "cookies"
+LEGACY_TWITTER_COOKIES = STATE_DIR / "twitter_cookies.json"
 
 # Providers where a browser sign-in unlocks additional content.  Eporner has
 # no account wall, and Twitter keeps its existing token/cookie import flow.
-SIGN_IN_SITES: tuple[str, ...] = ("PornHub", "RedTube", "xHamster")
+SIGN_IN_SITES: tuple[str, ...] = ("PornHub", "RedTube", "xHamster", "Twitter")
 
 SITE_LOGIN_URLS: dict[str, str] = {
     "PornHub": "https://www.pornhub.com/login",
     "RedTube": "https://www.redtube.com/login",
     "xHamster": "https://xhamster.com/login",
+    "Twitter": "https://x.com/login",
 }
 SITE_HOME_URLS: dict[str, str] = {
     "PornHub": "https://www.pornhub.com/",
     "RedTube": "https://www.redtube.com/",
     "xHamster": "https://xhamster.com/",
+    "Twitter": "https://x.com/home",
 }
 SITE_COOKIE_DOMAINS: dict[str, tuple[str, ...]] = {
     "PornHub": ("pornhub.com", "pornhub.org"),
     "RedTube": ("redtube.com", "redtube.com.br"),
     "xHamster": ("xhamster.com", "xhamster.desi", "xhamster.xxx"),
+    "Twitter": ("x.com", "twitter.com"),
 }
 
 _POLL_SECONDS = 0.5
@@ -58,6 +65,15 @@ class SignInResult:
     site: str
     saved: bool
     cookie_count: int
+    message: str
+
+
+@dataclass(frozen=True)
+class SessionCheck:
+    """Result of probing whether a stored session is still authenticated."""
+
+    site: str
+    status: str  # "valid", "invalid", "unknown", or "missing"
     message: str
 
 
@@ -187,6 +203,28 @@ def cookie_count(site: str) -> int:
 
 def is_signed_in(site: str) -> bool:
     return cookie_count(site) > 0
+
+
+def legacy_twitter_auth_token() -> str:
+    """Read the legacy ``twitter_cookies.json`` auth_token, if present."""
+    try:
+        payload = json.loads(LEGACY_TWITTER_COOKIES.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    token = payload.get("auth_token")
+    return token.strip() if isinstance(token, str) else ""
+
+
+def has_cookie(site: str, name: str) -> bool:
+    """True when the stored session contains a cookie with ``name``."""
+    return any(str(cookie.get("name")) == name for cookie in load_cookies(site))
+
+
+def twitter_authenticated() -> bool:
+    """True when a Twitter/X session exists in either cookie store."""
+    return has_cookie("Twitter", "auth_token") or bool(legacy_twitter_auth_token())
 
 
 def clear_cookies(site: str) -> bool:
@@ -397,5 +435,114 @@ def sign_in(
     suffix = " (sign-in window timed out; saved the current session)" if timed_out else ""
     return SignInResult(
         site, True, count,
-        f"{site}: signed in; saved {count} session cookie(s){suffix}.",
+        f"{site}: saved {count} session cookie(s){suffix}; use Test session to verify the login.",
     )
+
+
+
+def _probe_twitter_session(client, *, has_auth_token: bool) -> SessionCheck:
+    if not has_auth_token:
+        return SessionCheck(
+            "Twitter", "invalid",
+            "Twitter: the stored session has no auth_token; sign in again.",
+        )
+    response = client.get("https://x.com/home")
+    final_url = str(response.url).lower()
+    if "/i/flow/login" in final_url or "mode=login" in final_url or "onboarding" in final_url:
+        return SessionCheck(
+            "Twitter", "invalid",
+            "Twitter: the stored session is not logged in; sign in again.",
+        )
+    if response.status_code == 200:
+        return SessionCheck("Twitter", "valid", "Twitter: the stored session is logged in.")
+    if response.status_code in {401, 403}:
+        return SessionCheck(
+            "Twitter", "invalid",
+            f"Twitter: the site rejected the stored session (HTTP {response.status_code}).",
+        )
+    return SessionCheck(
+        "Twitter", "unknown",
+        f"Twitter: the session check got HTTP {response.status_code}.",
+    )
+
+
+def _probe_xhamster_session(client) -> SessionCheck:
+    response = client.get("https://xhamster.com/")
+    match = re.search(r'"isAuth"\s*:\s*(true|false)', response.text or "")
+    if not match:
+        return SessionCheck(
+            "xHamster", "unknown",
+            "xHamster: the page did not report a login state; the session could not be verified.",
+        )
+    if match.group(1) == "true":
+        return SessionCheck("xHamster", "valid", "xHamster: the stored session is logged in.")
+    return SessionCheck(
+        "xHamster", "invalid",
+        "xHamster: the stored session is not logged in; sign in again.",
+    )
+
+
+def _probe_aylo_session(site: str, client) -> SessionCheck:
+    response = client.get(SITE_HOME_URLS[site])
+    text = response.text or ""
+    if is_age_wall_page(text):
+        return SessionCheck(
+            site, "unknown",
+            f"{site}: the site served its age wall, so the session could not be verified "
+            "from this network.",
+        )
+    if is_pornhub_sfw_page(text):
+        return SessionCheck(
+            site, "unknown",
+            f"{site}: the site served its restricted catalog, so the session could not be "
+            "verified from this network.",
+        )
+    if (
+        re.search(r"\bisLoggedInUser\s*=\s*1\b", text)
+        or re.search(r'"isLoggedIn"\s*:\s*true', text)
+        or "profileMenuDropdown" in text
+        or "ph-icon-logout" in text
+    ):
+        return SessionCheck(site, "valid", f"{site}: the stored session is logged in.")
+    if (
+        re.search(r"\bisLoggedInUser\s*=\s*0\b", text)
+        or re.search(r'"isLoggedIn"\s*:\s*false', text)
+    ):
+        return SessionCheck(
+            site, "invalid",
+            f"{site}: the stored session is not logged in; sign in again.",
+        )
+    return SessionCheck(
+        site, "unknown",
+        f"{site}: the page did not report a login state; the session could not be verified.",
+    )
+
+
+def test_session(site: str, *, timeout: float = 15.0) -> SessionCheck:
+    """Probe whether the stored session for ``site`` is still logged in.
+
+    Uses a lightweight HTTP request per provider. ``unknown`` is reported when
+    the site hides its login state (for example behind a regional age wall)
+    rather than guessing.
+    """
+    site = _normalize_site(site)
+    legacy_token = legacy_twitter_auth_token() if site == "Twitter" else ""
+    if not is_signed_in(site) and not legacy_token:
+        return SessionCheck(site, "missing", f"{site}: no stored session; sign in first.")
+    try:
+        with build_client(timeout=timeout, follow_redirects=True) as client:
+            if is_signed_in(site):
+                apply_to_httpx(client, site)
+            elif legacy_token:
+                client.cookies.set("auth_token", legacy_token, domain=".x.com", path="/")
+            if site == "Twitter":
+                has_token = has_cookie("Twitter", "auth_token") or bool(legacy_token)
+                return _probe_twitter_session(client, has_auth_token=has_token)
+            if site == "xHamster":
+                return _probe_xhamster_session(client)
+            return _probe_aylo_session(site, client)
+    except Exception as exc:
+        return SessionCheck(
+            site, "unknown",
+            f"{site}: the session check failed ({exc.__class__.__name__}: {exc}).",
+        )

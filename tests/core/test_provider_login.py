@@ -11,6 +11,11 @@ import pytest
 from fetcher_core import provider_login
 
 
+@pytest.fixture(autouse=True)
+def _isolated_legacy_twitter(tmp_path, monkeypatch):
+    monkeypatch.setattr(provider_login, "LEGACY_TWITTER_COOKIES", tmp_path / "isolated_twitter_cookies.json")
+
+
 @pytest.fixture()
 def cookies_dir(tmp_path, monkeypatch):
     directory = tmp_path / "cookies"
@@ -182,7 +187,8 @@ def test_sign_in_saves_cookies_when_done(monkeypatch, cookies_dir):
 
     assert result.saved is True
     assert result.cookie_count == 1
-    assert "signed in" in result.message.lower()
+    assert "saved 1 session cookie" in result.message.lower()
+    assert "test session" in result.message.lower()
     assert provider_login.is_signed_in("PornHub") is True
     assert state["quit"] is True
 
@@ -243,3 +249,121 @@ def test_sign_in_reports_cookie_save_failure(monkeypatch, cookies_dir):
 
     assert result.saved is False
     assert "could not save" in result.message.lower()
+
+
+def _mock_http(monkeypatch, handler):
+    import httpx
+
+    monkeypatch.setattr(
+        provider_login, "build_client",
+        lambda **kwargs: httpx.Client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=kwargs.get("follow_redirects", False),
+        ),
+    )
+
+
+def _store(site: str, **cookies) -> None:
+    provider_login.save_cookies(
+        site,
+        [{"name": name, "value": value, "domain": f".{site.lower()}.com", "path": "/"} for name, value in cookies.items()],
+    )
+
+
+def test_test_session_reports_missing_without_store(cookies_dir):
+    check = provider_login.test_session("PornHub")
+
+    assert check.status == "missing"
+    assert "no stored session" in check.message.lower()
+
+
+@pytest.mark.parametrize(
+    ("page", "expected_status"),
+    [
+        ("<script>var isLoggedInUser = 1;</script>", "valid"),
+        ("<script>var isLoggedInUser = 0;</script>", "invalid"),
+        ('<video class="age-wall-video" src="promo.mp4"></video>', "unknown"),
+        ("<body>nothing to see</body>", "unknown"),
+    ],
+)
+def test_aylo_session_probe(monkeypatch, cookies_dir, page, expected_status):
+    _store("PornHub", sessid="abc")
+    _mock_http(monkeypatch, lambda request: httpx.Response(200, text=page, request=request))
+
+    check = provider_login.test_session("PornHub")
+
+    assert check.status == expected_status
+    assert check.site == "PornHub"
+
+
+@pytest.mark.parametrize(("marker", "expected_status"), [("true", "valid"), ("false", "invalid")])
+def test_xhamster_session_probe(monkeypatch, cookies_dir, marker, expected_status):
+    _store("xHamster", sessid="abc")
+    _mock_http(
+        monkeypatch,
+        lambda request: httpx.Response(200, text=f'{{"isAuth":{marker}}}', request=request),
+    )
+
+    check = provider_login.test_session("xHamster")
+
+    assert check.status == expected_status
+
+
+def test_twitter_session_probe_needs_auth_token(monkeypatch, cookies_dir):
+    _store("Twitter", ct0="csrf-only")
+    _mock_http(monkeypatch, lambda request: httpx.Response(200, text="home", request=request))
+
+    check = provider_login.test_session("Twitter")
+
+    assert check.status == "invalid"
+    assert "auth_token" in check.message
+
+
+def test_twitter_session_probe_accepts_logged_in_home(monkeypatch, cookies_dir):
+    _store("Twitter", auth_token="token")
+    _mock_http(monkeypatch, lambda request: httpx.Response(200, text="home", request=request))
+
+    check = provider_login.test_session("Twitter")
+
+    assert check.status == "valid"
+
+
+def test_twitter_session_probe_rejects_login_redirect(monkeypatch, cookies_dir):
+    _store("Twitter", auth_token="token")
+
+    def handler(request):
+        if request.url.path == "/home":
+            return httpx.Response(302, headers={"location": "https://x.com/i/flow/login"}, request=request)
+        return httpx.Response(200, text="login page", request=request)
+
+    _mock_http(monkeypatch, handler)
+
+    check = provider_login.test_session("Twitter")
+
+    assert check.status == "invalid"
+    assert "not logged in" in check.message
+
+
+def test_test_session_reports_network_failure_as_unknown(monkeypatch, cookies_dir):
+    _store("PornHub", sessid="abc")
+
+    def fail(request):
+        raise httpx.ConnectError("no network", request=request)
+
+    _mock_http(monkeypatch, fail)
+
+    check = provider_login.test_session("PornHub")
+
+    assert check.status == "unknown"
+    assert "failed" in check.message.lower()
+
+
+def test_test_session_uses_legacy_twitter_auth_token(monkeypatch, cookies_dir):
+    provider_login.LEGACY_TWITTER_COOKIES.parent.mkdir(parents=True, exist_ok=True)
+    provider_login.LEGACY_TWITTER_COOKIES.write_text('{"auth_token": "legacy-token"}', encoding="utf-8")
+    _mock_http(monkeypatch, lambda request: httpx.Response(200, text="home", request=request))
+
+    check = provider_login.test_session("Twitter")
+
+    assert check.status == "valid"
+    assert provider_login.twitter_authenticated() is True

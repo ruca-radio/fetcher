@@ -523,3 +523,108 @@ def test_cli_login_reports_start_failure_without_traceback(monkeypatch, capsys) 
 
     assert fetchtui.cli_login(args, fetchtui.AppSettings()) == 1
     assert "sign-in failed" in capsys.readouterr().err
+
+
+def test_cli_session_status_reports_each_provider(monkeypatch, capsys) -> None:
+    messages = {
+        "PornHub": ("valid", "PornHub: the stored session is logged in."),
+        "RedTube": ("unknown", "RedTube: the site served its age wall."),
+        "xHamster": ("missing", "xHamster: no stored session; sign in first."),
+        "Twitter": ("invalid", "Twitter: the stored session is not logged in."),
+    }
+
+    def fake_test(site):
+        status, message = messages[site]
+        return SimpleNamespace(site=site, status=status, message=message)
+
+    monkeypatch.setattr(fetchtui.provider_login, "test_session", fake_test)
+    args = fetchtui.build_parser().parse_args(["session-status"])
+
+    assert fetchtui.cli_session_status(args, fetchtui.AppSettings()) == 1
+    captured = capsys.readouterr()
+    assert "PornHub: the stored session is logged in." in captured.out
+    assert "RedTube: the site served its age wall." in captured.out
+
+    monkeypatch.setattr(
+        fetchtui.provider_login, "test_session",
+        lambda site: SimpleNamespace(site=site, status="valid", message=f"{site}: ok."),
+    )
+    args = fetchtui.build_parser().parse_args(["session-status", "--site", "PornHub"])
+    assert fetchtui.cli_session_status(args, fetchtui.AppSettings()) == 0
+    assert capsys.readouterr().out.strip() == "PornHub: ok."
+
+
+def test_tui_provider_session_test_finished_updates_status() -> None:
+    class _StaticStub:
+        def __init__(self):
+            self.value = ""
+
+        def update(self, value):
+            self.value = value
+
+    class _AppStub:
+        def __init__(self):
+            self.widgets = {"#settings-signin-pornhub": _StaticStub()}
+            self.statuses = []
+            self.logs = []
+
+        def query_one(self, selector, *args, **kwargs):
+            return self.widgets[selector]
+
+        def _set_settings_status(self, message):
+            self.statuses.append(message)
+
+        def _log(self, message):
+            self.logs.append(message)
+
+    app = _AppStub()
+    check = SimpleNamespace(site="PornHub", status="valid", message="PornHub: the stored session is logged in.")
+
+    fetchtui.FetchTUI._provider_session_test_finished(app, check)
+
+    assert app.widgets["#settings-signin-pornhub"].value == check.message
+    assert app.statuses == [check.message]
+    assert app.logs == [check.message]
+
+
+def test_tui_twitter_signin_finished_updates_login_button(monkeypatch) -> None:
+    class _ButtonStub:
+        def __init__(self):
+            self.label = "Login"
+            self.variant = "warning"
+            self.disabled = True
+
+    class _StaticStub:
+        def __init__(self):
+            self.value = ""
+
+        def update(self, value):
+            self.value = value
+
+    class _AppStub:
+        def __init__(self):
+            self._tw_signin_active = True
+            self._tw_logged_in = False
+            self.button = _ButtonStub()
+            self.status = _StaticStub()
+            self.logs = []
+
+        def query_one(self, selector, *args, **kwargs):
+            return self.button if selector == "#tw-btn-login" else self.status
+
+        def _log(self, message):
+            self.logs.append(message)
+
+    monkeypatch.setattr(fetchtui.provider_login, "twitter_authenticated", lambda: True)
+    app = _AppStub()
+    result = SimpleNamespace(saved=True, message="Twitter: signed in; saved 5 session cookie(s).")
+
+    fetchtui.FetchTUI._tw_signin_finished(app, result)
+
+    assert app._tw_signin_active is False
+    assert app._tw_logged_in is True
+    assert app.button.label == "✓ Logged in"
+    assert app.button.variant == "success"
+    assert app.button.disabled is False
+    assert app.status.value == result.message
+    assert app.logs == [result.message]

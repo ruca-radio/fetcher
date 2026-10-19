@@ -7,9 +7,14 @@ import httpx
 import pytest
 
 import fetcher_core.providers as providers
-from fetcher_core import age_gate
+from fetcher_core import age_gate, provider_login
 from fetcher_core.models import AppSettings, SearchFilters, Video
 from fetcher_core.providers import build_filters_from_args
+
+
+@pytest.fixture(autouse=True)
+def _isolated_provider_cookies(tmp_path, monkeypatch):
+    monkeypatch.setattr(provider_login, "COOKIES_DIR", tmp_path / "isolated-provider-cookies")
 
 
 class _ClientContext:
@@ -661,6 +666,44 @@ def test_search_twitter_records_missing_auth_token(tmp_path):
     providers.LAST_PROVIDER_ERRORS.pop("Twitter", None)
     assert providers.search_twitter("cats", 5, cookies) == []
     assert "auth_token" in providers.LAST_PROVIDER_ERRORS["Twitter"]
+
+
+def test_search_twitter_uses_provider_signin_session(monkeypatch, tmp_path):
+    import selenium.webdriver as webdriver
+
+    provider_login.save_cookies(
+        "Twitter",
+        [
+            {"name": "auth_token", "value": "session-token", "domain": ".x.com", "path": "/"},
+            {"name": "ct0", "value": "csrf-token", "domain": ".x.com", "path": "/"},
+        ],
+    )
+    added: list[dict] = []
+    visited: list[str] = []
+
+    class Driver:
+        def get(self, url):
+            visited.append(url)
+
+        def add_cookie(self, cookie):
+            added.append(cookie)
+
+        def execute_script(self, *args):
+            return None
+
+        def get_log(self, name):
+            return []
+
+        def quit(self):
+            pass
+
+    monkeypatch.setattr(webdriver, "Chrome", lambda **kwargs: Driver())
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    assert providers.search_twitter("cats", 5, tmp_path / "missing.json") == []
+    assert [cookie["name"] for cookie in added] == ["auth_token", "ct0"]
+    assert visited[0] == "https://x.com"
+    assert any("/search?q=cats" in url for url in visited)
 
 
 def test_search_twitter_records_webdriver_failure(tmp_path, monkeypatch):

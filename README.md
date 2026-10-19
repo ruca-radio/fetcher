@@ -154,6 +154,12 @@ Optional download arguments:
 - `--tmp-dir PATH`
 - `--min-height PIXELS` — overrides `min_download_height` for this command; `0` disables the floor
 
+Provider sessions:
+
+- `fetcher login --site <PornHub|RedTube|xHamster|Twitter>` — sign in through a Chrome window
+- `fetcher logout --site <provider>` — forget the stored session
+- `fetcher session-status [--site <provider>]` — check stored sessions (exit 0 only when every checked session is valid)
+
 ### Batch Search + Download
 
 Search, take the top matching items, and download them:
@@ -190,7 +196,7 @@ The Textual interface includes:
 
 ## Native GUI
 
-The desktop interface provides Discover, Downloads, Library, and Settings workspaces. Search and file operations run outside the UI thread, downloads retain stop/retry state, and the player supports local playback, seeking, volume, mute, and full screen. Settings includes provider sign-in for PornHub, RedTube, and xHamster.
+The desktop interface provides Discover, Downloads, Library, and Settings workspaces. Search and file operations run outside the UI thread, downloads retain stop/retry state, and the player supports local playback, seeking, volume, mute, and full screen. Settings includes provider sign-in for PornHub, RedTube, xHamster, and Twitter/X.
 
 Local storage paths are used directly. An SFTP destination uses the portable form:
 
@@ -204,13 +210,15 @@ Remote previews are materialized under `.fetcher/preview-cache` in a source chec
 
 ## Provider Sign-In
 
-PornHub, RedTube, and xHamster may require a signed-in session (including an accepted age prompt) before they expose their full catalog, player data, or downloads. Instead of copying cookies by hand:
+PornHub, RedTube, xHamster, and Twitter/X may require a signed-in session (including an accepted age prompt) before they expose their full catalog, player data, or downloads. Instead of copying cookies by hand:
 
-- TUI: open the **Settings** tab → **Provider Sign-ins** → **Sign in**.
+- TUI: open the **Settings** tab → **Provider Sign-ins** → **Sign in**. The Twitter/X tab's **Login** button now starts the same browser sign-in.
 - GUI: **Settings** → **Provider Sign-ins** → **Sign in**.
-- CLI: `fetcher login --site PornHub` (also `RedTube` / `xHamster`), and `fetcher logout --site PornHub` to forget the session.
+- CLI: `fetcher login --site PornHub` (also `RedTube`, `xHamster`, `Twitter`), and `fetcher logout --site PornHub` to forget the session.
 
-Fetcher opens a visible Chrome window on the provider's sign-in page. Log in there (including any 2FA), then close the window; Fetcher captures the resulting session cookies. They are stored owner-only under `.fetcher/cookies` in a source checkout (or `$XDG_DATA_HOME/fetcher/cookies` after package installation), never logged, and used by search requests, yt-dlp downloads, previews, and the browser fallback. **Signing in does not bypass regional age-verification blocks**; see Troubleshooting.
+Fetcher opens a visible Chrome window on the provider's sign-in page. Log in there (including any 2FA), then close the window; Fetcher captures the resulting session cookies. They are stored owner-only under `.fetcher/cookies` in a source checkout (or `$XDG_DATA_HOME/fetcher/cookies` after package installation), never logged, and used by search requests, yt-dlp downloads, previews, and the browser fallback.
+
+Each row also has a **Test** button (CLI: `fetcher session-status [--site SITE]`) that performs a lightweight authenticated check and reports whether the stored session is still logged in. Sites that hide their login state behind a regional age wall are reported as "could not be verified" rather than guessed. **Signing in does not bypass regional age-verification blocks**; see Troubleshooting.
 
 ## Twitter/X Setup
 
@@ -226,12 +234,11 @@ This writes cookie state to:
 ./.fetcher/twitter_cookies.json
 ```
 
-You can also use the TUI login dialog and paste either:
-
-- a raw `auth_token`
-- a JSON object containing `auth_token`
+For compatibility you can still import `auth_token` manually by writing `.fetcher/twitter_cookies.json` (for example with `extract_twitter_cookies.py`); the TUI login dialog now uses the browser sign-in described above instead of pasting tokens.
 
 Fetcher uses this stored cookie state for both Twitter/X search and downloads. For downloads it converts the JSON into a temporary Netscape cookie file for yt-dlp, so Twitter/X downloads no longer require a Chrome profile (Fetcher only falls back to `--cookies-from-browser chrome` when no stored `auth_token` is available).
+
+The manual token import remains supported for compatibility, but the **Provider Sign-ins → Twitter** browser flow (or the Twitter tab's **Login** button) is now the normal way to authenticate and stores the full browser session instead of only `auth_token`.
 
 ## Runtime State
 
@@ -246,7 +253,7 @@ This directory includes:
 - `settings.json`
 - `downloaded_ids.txt`
 - `twitter_cookies.json`
-- `cookies/` — owner-only provider sign-in sessions (PornHub, RedTube, xHamster)
+- `cookies/` — owner-only provider sign-in sessions (PornHub, RedTube, xHamster, Twitter/X)
 
 A few `settings.json` values are user-tunable:
 
