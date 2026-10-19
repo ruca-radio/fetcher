@@ -888,9 +888,29 @@ def test_resolve_stream_urls_uses_cookie_file_and_impersonation(monkeypatch, tmp
     assert urls == ["https://media.test/x.m3u8"]
     assert error is None
     cmd = captured["cmd"]
+    assert cmd[cmd.index("-f") + 1] == download.YTDLP_FLEX_FORMAT
     assert cmd[cmd.index("--cookies") + 1] == str(tmp_path / "twitter_cookies.net.txt")
     if download._CURL_CFFI_AVAILABLE:
         assert cmd[cmd.index("--impersonate") + 1] == "chrome"
+
+
+def test_resolve_stream_urls_ignores_the_download_quality_floor(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "https://media.test/480.mp4\n", "")
+
+    monkeypatch.setattr(download, "resolve_ytdlp_command", lambda: (["yt-dlp"], None))
+    monkeypatch.setattr(download.subprocess, "run", fake_run)
+
+    urls, error = download.resolve_stream_urls(video("Eporner", "e480"))
+
+    assert urls == ["https://media.test/480.mp4"]
+    assert error is None
+    selector = captured["cmd"][captured["cmd"].index("-f") + 1]
+    assert selector == download.YTDLP_FLEX_FORMAT
+    assert "height>=" not in selector
 
 
 def test_resolve_direct_download_urls_adds_impersonation(monkeypatch) -> None:

@@ -59,7 +59,7 @@ HTTP/HTTPS video files use aria2 when installed, with up to 16 connections contr
 
 If PornHub, RedTube, or xHamster extraction fails, Fetcher can start a separate headless Chrome session and read the running player's stream data. This requires Chrome and Selenium; it does not use your normal Chrome profile. Site login, regional restrictions, and unavailable videos can still prevent extraction. The Downloads page shows the full failure message below the table and in the ETA tooltip.
 
-Completed media must meet `min_download_height` (720p by default). Fetcher never selects a known sub-`min_download_height` format: it drives every yt-dlp selector, the direct-URL resolver, and the browser player-data reader from that floor, so when no eligible stream exists the job fails fast with a clear message instead of downloading a low-quality file and deleting it afterwards. Search metadata that omits quality stays unknown until the download stage resolves the site's actual formats; resolved fallback URLs are inspected with `ffprobe` before a transfer starts, and the final `ffprobe` check remains a safety net.
+Completed media must meet `min_download_height` (720p by default); previews and in-app playback are exempt and use the best available stream. Fetcher never selects a known sub-`min_download_height` format: it drives every yt-dlp selector, the direct-URL resolver, and the browser player-data reader from that floor, so when no eligible stream exists the job fails fast with a clear message instead of downloading a low-quality file and deleting it afterwards. Search metadata that omits quality stays unknown until the download stage resolves the site's actual formats; resolved fallback URLs are inspected with `ffprobe` before a transfer starts, and the final `ffprobe` check remains a safety net.
 
 ## Quick Start
 
@@ -152,6 +152,7 @@ Optional download arguments:
 - `--site {PornHub,xHamster,RedTube,Eporner,Twitter}`
 - `--output-dir PATH`
 - `--tmp-dir PATH`
+- `--min-height PIXELS` — overrides `min_download_height` for this command; `0` disables the floor
 
 ### Batch Search + Download
 
@@ -172,6 +173,8 @@ Print the selected batch as JSON before downloading:
 ```bash
 fetcher batch "query" --limit 5 --json
 ```
+
+Batch downloads accept the same `--min-height PIXELS` override as `download`.
 
 ## TUI Features
 

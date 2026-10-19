@@ -1001,11 +1001,16 @@ def create_download_manager(settings: AppSettings, tmp_dir: Path, output_dir: Pa
 
 
 def resolve_stream_urls(video: Video) -> tuple[list[str], Optional[str]]:
-    """Resolve direct media URLs for mpv without relying on mpv's yt-dlp hook."""
+    """Resolve direct media URLs for mpv without relying on mpv's yt-dlp hook.
+
+    Preview/playback is not a download: prefer the best available stream even
+    when it is below the configured download floor, so sub-720p videos can
+    still be previewed instead of failing the quality policy.
+    """
     ytdlp_cmd, ytdlp_error = resolve_ytdlp_command()
     if ytdlp_error or not ytdlp_cmd:
         return [], ytdlp_error or "yt-dlp is unavailable"
-    cmd = [*ytdlp_cmd, "-g", "--no-playlist", "-f", YTDLP_FORMAT]
+    cmd = [*ytdlp_cmd, "-g", "--no-playlist", "-f", YTDLP_FLEX_FORMAT]
     cmd.extend(_impersonation_args())
     if video.site == "Twitter":
         cmd.extend(_twitter_cookie_args())

@@ -16,7 +16,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, ArgumentTypeError, Namespace
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -95,6 +95,7 @@ from fetcher_core.models import (
     DEFAULT_MIN_QUALITY as DEFAULT_MIN_QUALITY,  # re-export (public API of fetchtui)
     DEFAULT_SEARXNG_URL as DEFAULT_SEARXNG_URL,  # re-export (public API of fetchtui)
     DownloadJob,
+    DownloadPolicy,
     FileEntry,
     FileSortKey,
     SearchFilters,
@@ -2007,6 +2008,28 @@ def run_tui() -> int:
     return 0
 
 
+def _min_height_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ArgumentTypeError("must be an integer pixel height") from None
+    if not 0 <= parsed <= 4320:
+        raise ArgumentTypeError("must be between 0 and 4320")
+    return parsed
+
+
+def _download_policy(settings: AppSettings, min_height: Optional[int]) -> DownloadPolicy:
+    """Apply a per-command download floor on top of the configured policy."""
+    policy = settings.download_policy()
+    if min_height is None:
+        return policy
+    return DownloadPolicy(
+        min_height=min_height,
+        preview_ratio=policy.preview_ratio,
+        preview_min_seconds=policy.preview_min_seconds,
+    )
+
+
 def build_parser() -> ArgumentParser:
     parser = ArgumentParser(prog="fetcher", description="Fetcher v1.0 GUI, CLI, and TUI")
     sub = parser.add_subparsers(dest="command")
@@ -2033,6 +2056,10 @@ def build_parser() -> ArgumentParser:
     download.add_argument("--site", choices=["PornHub", "xHamster", "RedTube", "Eporner", "Twitter"], default="PornHub")
     download.add_argument("--output-dir")
     download.add_argument("--tmp-dir")
+    download.add_argument(
+        "--min-height", type=_min_height_arg, metavar="PIXELS",
+        help="Download quality floor in pixels for this run (0 disables the floor)",
+    )
 
     batch = sub.add_parser("batch", help="Search and download the top matching results")
     batch.add_argument("query")
@@ -2049,6 +2076,10 @@ def build_parser() -> ArgumentParser:
     batch.add_argument("--parallel", type=int, default=1)
     batch.add_argument("--output-dir")
     batch.add_argument("--tmp-dir")
+    batch.add_argument(
+        "--min-height", type=_min_height_arg, metavar="PIXELS",
+        help="Download quality floor in pixels for this run (0 disables the floor)",
+    )
     batch.add_argument("--json", action="store_true", help="Print selected results as JSON before downloading")
 
     return parser
@@ -2094,11 +2125,12 @@ def cli_download(args: Namespace, settings: AppSettings) -> int:
     for warning in warnings:
         print(f"Warning: {warning}", file=sys.stderr)
 
+    policy = _download_policy(settings, getattr(args, "min_height", None))
     exit_code = 0
     for target in args.targets:
         video = build_download_video(target, args.site)
         print(f"Downloading [{video.site}] {video.url}")
-        job = download_one(video, tmp_dir, output_dir, settings.download_policy())
+        job = download_one(video, tmp_dir, output_dir, policy)
         if job.status == "done":
             print(f"Saved to {job.filepath}")
         else:
@@ -2131,7 +2163,7 @@ def cli_batch(args: Namespace, settings: AppSettings) -> int:
 
     jobs = run_batch_download(
         selected, tmp_dir, output_dir, parallel=max(1, args.parallel),
-        policy=settings.download_policy(),
+        policy=_download_policy(settings, getattr(args, "min_height", None)),
     )
 
     failures = [job for job in jobs if job.status != "done"]

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import fetchtui
-from fetcher_core.models import SearchFilters
+from fetcher_core.models import DownloadJob, SearchFilters, Video
 
 
 class _Widget:
@@ -251,3 +253,65 @@ def test_settings_tab_rejects_non_numeric_min_download_height(monkeypatch) -> No
 
     assert saved == []
     assert statuses and "must be a number" in statuses[0]
+
+
+def _runtime_dirs_stub(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        fetchtui, "resolve_runtime_dirs",
+        lambda settings: (tmp_path / "tmp", tmp_path / "out", []),
+    )
+
+
+def test_cli_download_uses_configured_policy_by_default(monkeypatch, tmp_path, capsys) -> None:
+    _runtime_dirs_stub(monkeypatch, tmp_path)
+    captured = {}
+
+    def fake_download(video, tmp_dir, output_dir, policy):
+        captured["policy"] = policy
+        return SimpleNamespace(status="done", filepath=tmp_path / "out" / "clip.mkv")
+
+    monkeypatch.setattr(fetchtui, "download_one", fake_download)
+    args = fetchtui.build_parser().parse_args(["download", "https://example.test/v"])
+
+    assert fetchtui.cli_download(args, fetchtui.AppSettings(min_download_height=1080)) == 0
+    assert captured["policy"].min_height == 1080
+
+
+def test_cli_download_min_height_overrides_the_configured_floor(monkeypatch, tmp_path) -> None:
+    _runtime_dirs_stub(monkeypatch, tmp_path)
+    captured = {}
+
+    def fake_download(video, tmp_dir, output_dir, policy):
+        captured["policy"] = policy
+        return SimpleNamespace(status="done", filepath=tmp_path / "out" / "clip.mkv")
+
+    monkeypatch.setattr(fetchtui, "download_one", fake_download)
+    args = fetchtui.build_parser().parse_args(
+        ["download", "https://example.test/v", "--min-height", "1080"]
+    )
+
+    assert fetchtui.cli_download(args, fetchtui.AppSettings(min_download_height=720)) == 0
+    assert captured["policy"].min_height == 1080
+
+
+def test_cli_batch_min_height_zero_disables_the_floor(monkeypatch, tmp_path) -> None:
+    _runtime_dirs_stub(monkeypatch, tmp_path)
+    video = Video("v1", "clip", 60, 0, "https://example.test/v", "Eporner")
+    monkeypatch.setattr(fetchtui, "_cli_search_results", lambda args, settings: [video])
+    captured = {}
+
+    def fake_batch(videos, tmp_dir, output_dir, parallel, policy):
+        captured["policy"] = policy
+        return [DownloadJob(video=video, status="done")]
+
+    monkeypatch.setattr(fetchtui, "run_batch_download", fake_batch)
+    args = fetchtui.build_parser().parse_args(["batch", "query", "--min-height", "0"])
+
+    assert fetchtui.cli_batch(args, fetchtui.AppSettings(min_download_height=720)) == 0
+    assert captured["policy"].min_height == 0
+
+
+@pytest.mark.parametrize("value", ["-1", "5000", "nope", "1.5"])
+def test_cli_min_height_rejects_invalid_values(value) -> None:
+    with pytest.raises(SystemExit):
+        fetchtui.build_parser().parse_args(["download", "https://example.test/v", "--min-height", value])
