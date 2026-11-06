@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Fetcher v1.0 - Multi-site video downloader
 Tabs: Porn (PornHub · xHamster · RedTube · Eporner) | Twitter/X
@@ -6,23 +8,20 @@ Parallel downloads with per-video progress bars
 Temporary downloads are moved into the configured output directory on completion
 """
 
+import inspect
 import json
+import logging
 import math
 import os
-import re
 import shutil
 import signal
 import subprocess
 import sys
-from argparse import ArgumentParser, Namespace
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from datetime import datetime
+import threading
+from argparse import ArgumentParser, ArgumentTypeError, Namespace
 from io import BytesIO
 from pathlib import Path
-from typing import Literal, Optional
-from urllib.parse import quote_plus
+from typing import Optional
 
 import httpx
 from PIL import Image
@@ -40,139 +39,174 @@ from textual.widgets import (
     TabbedContent, TabPane,
 )
 
+from fetcher_core.download_log import (
+    DownloadCatalog,
+    downloads_log_path,
+    video_is_downloaded,
+    without_downloaded,
+)
+from fetcher_core.download import (
+    DOWNLOADED_IDS,
+    FFMPEG as FFMPEG,  # re-export (public API of fetchtui)
+    FFPROBE as FFPROBE,  # re-export (public API of fetchtui)
+    MEDIA_EXTENSIONS,
+    MIN_DOWNLOAD_HEIGHT as MIN_DOWNLOAD_HEIGHT,  # re-export (public API of fetchtui)
+    PARTIAL_EXTENSIONS as PARTIAL_EXTENSIONS,  # re-export (public API of fetchtui)
+    YTDLP as YTDLP,  # re-export (public API of fetchtui)
+    YTDLP_FORMAT as YTDLP_FORMAT,  # re-export (public API of fetchtui)
+    YTDLP_FLEX_FORMAT as YTDLP_FLEX_FORMAT,  # re-export (public API of fetchtui)
+    _best_download_failure as _best_download_failure,  # re-export (public API of fetchtui)
+    _build_ytdlp_download_cmd as _build_ytdlp_download_cmd,  # re-export (public API of fetchtui)
+    _failure_from_tail as _failure_from_tail,  # re-export (public API of fetchtui)
+    _finalize_downloaded_file as _finalize_downloaded_file,  # re-export (public API of fetchtui)
+    _fmt_size,
+    _is_pornhub_phantomjs_error as _is_pornhub_phantomjs_error,  # re-export (public API of fetchtui)
+    _job_temp_bytes as _job_temp_bytes,  # re-export (public API of fetchtui)
+    _job_temp_dir as _job_temp_dir,  # re-export (public API of fetchtui)
+    _latest_media_file as _latest_media_file,  # re-export (public API of fetchtui)
+    _probe_video_duration as _probe_video_duration,  # re-export (public API of fetchtui)
+    _probe_video_height as _probe_video_height,  # re-export (public API of fetchtui)
+    _provider_download_url as _provider_download_url,  # re-export (public API of fetchtui)
+    _resolve_direct_download_urls as _resolve_direct_download_urls,  # re-export (public API of fetchtui)
+    _resolve_pornhub_browser_urls as _resolve_pornhub_browser_urls,  # re-export (public API of fetchtui)
+    _run_download_process as _run_download_process,  # re-export (public API of fetchtui)
+    _run_ffmpeg_fallback as _run_ffmpeg_fallback,  # re-export (public API of fetchtui)
+    _safe_media_stem as _safe_media_stem,  # re-export (public API of fetchtui)
+    _site_ytdlp_args as _site_ytdlp_args,  # re-export (public API of fetchtui)
+    cleanup_tmp,
+    create_download_manager as create_download_manager,  # re-export (public API of fetchtui)
+    download_one,
+    resolve_stream_urls,
+    resolve_ytdlp_command as resolve_ytdlp_command,  # re-export (public API of fetchtui)
+    run_batch_download,
+    run_download,
+    ytdlp_version as ytdlp_version,  # re-export (public API of fetchtui)
+    ytdlp_version_warning as ytdlp_version_warning,  # re-export (public API of fetchtui)
+)
+from fetcher_core.filters import (
+    CENSORED_MEDIA_MARKERS as CENSORED_MEDIA_MARKERS,  # re-export (public API of fetchtui)
+    EPORNER_CENSORED_MARKERS as EPORNER_CENSORED_MARKERS,  # re-export (public API of fetchtui)
+    EPORNER_UNCENSORED_MARKERS as EPORNER_UNCENSORED_MARKERS,  # re-export (public API of fetchtui)
+    dedupe_videos as dedupe_videos,  # re-export (public API of fetchtui)
+    video_matches_filters,
+)
+from fetcher_core.filters import (
+    is_known_censored_media_url as _is_known_censored_media_url,  # noqa: F401 — re-export
+    looks_censored as _looks_censored,  # noqa: F401 — re-export
+    normalize_title as _normalize_title,
+    split_exclude_phrases as _split_exclude_phrases,
+)
+from fetcher_core.http import HEADERS
+from fetcher_core import provider_login
+from fetcher_core.models import (
+    AppSettings,
+    DEFAULT_EXCLUDE_PHRASES,
+    DEFAULT_MIN_QUALITY as DEFAULT_MIN_QUALITY,  # re-export (public API of fetchtui)
+    DEFAULT_SEARXNG_URL as DEFAULT_SEARXNG_URL,  # re-export (public API of fetchtui)
+    DownloadJob,
+    DownloadPolicy,
+    FileEntry,
+    FileSortKey,
+    SearchFilters,
+    STATE_DIR,
+    SortKey,
+    Video,
+)
+def _accepts_keyword(fn, name: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
+        return True
+    return name in parameters
+
+
+from fetcher_core.providers import (
+    LAST_PROVIDER_ERRORS,
+    LAST_PROVIDER_WARNINGS,
+    SITES,
+    SITE_FN,
+    TWITTER_COOKIES,
+    _clear_provider_error as _clear_provider_error,  # re-export (public API of fetchtui)
+    _first_clean_thumbnail as _first_clean_thumbnail,  # re-export (public API of fetchtui)
+    _format_provider_exception as _format_provider_exception,  # re-export (public API of fetchtui)
+    _least_factor as _least_factor,  # re-export (public API of fetchtui)
+    _parse_dur as _parse_dur,  # re-export (public API of fetchtui)
+    _parse_int as _parse_int,  # re-export (public API of fetchtui)
+    _parse_percent as _parse_percent,  # re-export (public API of fetchtui)
+    _parse_quality as _parse_quality,  # re-export (public API of fetchtui)
+    _pornhub_get as _pornhub_get,  # re-export (public API of fetchtui)
+    _record_provider_error as _record_provider_error,  # re-export (public API of fetchtui)
+    _resolved_searxng_url as _resolved_searxng_url,  # re-export (public API of fetchtui)
+    _search_pornhub_html as _search_pornhub_html,  # re-export (public API of fetchtui)
+    _search_provider,
+    _site_from_url as _site_from_url,  # re-export (public API of fetchtui)
+    _solve_pornhub_key_challenge as _solve_pornhub_key_challenge,  # re-export (public API of fetchtui)
+    _unwrap_nudevista_url as _unwrap_nudevista_url,  # re-export (public API of fetchtui)
+    _xh_parse as _xh_parse,  # re-export (public API of fetchtui)
+    build_download_video,
+    build_filters_from_args,
+    normalize_download_target as normalize_download_target,  # re-export (public API of fetchtui)
+    search_eporner as search_eporner,  # re-export (public API of fetchtui)
+    search_pornhub as search_pornhub,  # re-export (public API of fetchtui)
+    search_redtube as search_redtube,  # re-export (public API of fetchtui)
+    search_searxng as search_searxng,  # re-export (public API of fetchtui)
+    search_twitter,
+    search_videos,
+    search_xhamster as search_xhamster,  # re-export (public API of fetchtui)
+    video_to_dict,
+)
+from fetcher_core.settings import (
+    SettingsStore,
+    normalize_min_quality,
+    prepare_runtime_settings,
+    resolve_runtime_dirs,
+)
+from fetcher_core.state import harden_state_dir
+
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
-STATE_DIR = BASE_DIR / ".fetcher"
-DEFAULT_TMP_DIR = BASE_DIR / "tmp"
 DEFAULT_OUTPUT_DIR = Path.home() / "Downloads" / "fetcher"
-DOWNLOADED_IDS = STATE_DIR / "downloaded_ids.txt"
-TWITTER_COOKIES = STATE_DIR / "twitter_cookies.json"
 SETTINGS_PATH  = STATE_DIR / "settings.json"
-YTDLP = BASE_DIR / "yt-dlp"
-if not YTDLP.exists():
-    detected_ytdlp = shutil.which("yt-dlp")
-    YTDLP = Path(detected_ytdlp) if detected_ytdlp else Path("/usr/bin/yt-dlp")
-
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-DEFAULT_TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-SITES = ["All Sites", "PornHub", "xHamster", "RedTube", "Eporner"]
 MPV = shutil.which("mpv")
-DEFAULT_EXCLUDE_PHRASES = ""
+
+logger = logging.getLogger(__name__)
 
 
-# ── Already-downloaded detection ──────────────────────────────────────────────
-def _normalize_title(title: str) -> str:
-    """Lowercase, strip non-alphanumeric for fuzzy title matching."""
-    return re.sub(r"[^a-z0-9]", "", title.lower())
-
-
-def _split_exclude_phrases(raw: str) -> list[str]:
-    return [part.strip().lower() for part in raw.split(",") if part.strip()]
+def _harden_state() -> list[str]:
+    """Tighten permissions on the state dir and cookie file (never raises)."""
+    try:
+        notes = harden_state_dir(STATE_DIR, secret_files=[TWITTER_COOKIES])
+    except Exception:
+        logger.warning("state hardening failed", exc_info=True)
+        return []
+    for note in notes:
+        logger.info("state hardening: %s", note)
+    return notes
 
 
 def load_settings() -> AppSettings:
-    if SETTINGS_PATH.exists():
-        try:
-            data = json.loads(SETTINGS_PATH.read_text())
-            sf = data.get("search_filters", {}) or {}
-            return AppSettings(
-                theme=str(data.get("theme", "textual-dark")),
-                thumbnails_enabled=bool(data.get("thumbnails_enabled", True)),
-                video_previews_enabled=bool(data.get("video_previews_enabled", True)),
-                plex_dir=str(data.get("plex_dir", DEFAULT_OUTPUT_DIR)),
-                tmp_dir=str(data.get("tmp_dir", DEFAULT_TMP_DIR)),
-                parallel_downloads=max(1, int(data.get("parallel_downloads", 3))),
-                search_filters=SearchFilters(
-                    min_duration_min=max(0, int(sf.get("min_duration_min", 0) or 0)),
-                    max_duration_min=max(0, int(sf.get("max_duration_min", 0) or 0)),
-                    min_quality=str(sf.get("min_quality", "any")),  # type: ignore[arg-type]
-                    min_rating=max(0, int(sf.get("min_rating", 0) or 0)),
-                    hd_only=bool(sf.get("hd_only", False)),
-                    pages=max(1, int(sf.get("pages", 2) or 2)),
-                    exclude_phrases=str(sf.get("exclude_phrases", DEFAULT_EXCLUDE_PHRASES)),
-                ),
-            )
-        except Exception:
-            pass
-    return AppSettings()
+    return SettingsStore(SETTINGS_PATH, defaults=AppSettings()).load().settings
 
 
 def save_settings(settings: AppSettings) -> None:
-    SETTINGS_PATH.write_text(json.dumps({
-        "theme": settings.theme,
-        "thumbnails_enabled": settings.thumbnails_enabled,
-        "video_previews_enabled": settings.video_previews_enabled,
-        "plex_dir": settings.plex_dir,
-        "tmp_dir": settings.tmp_dir,
-        "parallel_downloads": settings.parallel_downloads,
-        "search_filters": {
-            "min_duration_min": settings.search_filters.min_duration_min,
-            "max_duration_min": settings.search_filters.max_duration_min,
-            "min_quality": settings.search_filters.min_quality,
-            "min_rating": settings.search_filters.min_rating,
-            "hd_only": settings.search_filters.hd_only,
-            "pages": settings.search_filters.pages,
-            "exclude_phrases": settings.search_filters.exclude_phrases,
-        },
-    }, indent=2))
+    store = SettingsStore(SETTINGS_PATH, defaults=AppSettings())
+    store.load()
+    store.save(settings)
 
 
 def load_downloaded(plex_dir: Path) -> tuple[set[str], set[str]]:
     """Return (video_ids, normalized_titles) of already-downloaded content."""
-    ids: set[str] = set()
-    titles: set[str] = set()
-    if DOWNLOADED_IDS.exists():
-        for line in DOWNLOADED_IDS.read_text().splitlines():
-            line = line.strip()
-            if line:
-                ids.add(line)
-    if plex_dir.exists():
-        for f in plex_dir.iterdir():
-            if f.suffix == ".mp4":
-                norm = _normalize_title(f.stem)
-                if norm:
-                    titles.add(norm)
-    return ids, titles
+    catalog = DownloadCatalog(downloads_log_path(DOWNLOADED_IDS), DOWNLOADED_IDS, [plex_dir])
+    catalog.reload()
+    return catalog.ids, catalog.titles
 
 
-def _fmt_size(nbytes: int) -> str:
-    if nbytes >= 1_073_741_824:
-        return f"{nbytes / 1_073_741_824:.1f} GB"
-    if nbytes >= 1_048_576:
-        return f"{nbytes / 1_048_576:.0f} MB"
-    return f"{nbytes / 1024:.0f} KB"
-
-
-def cleanup_tmp(tmp_dir: Path, plex_dir: Path) -> tuple[int, int]:
-    """Move completed mp4s to plex, delete stale partials. Returns (moved, deleted)."""
-    moved = deleted = 0
-    if not tmp_dir.exists():
-        return moved, deleted
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    plex_dir.mkdir(parents=True, exist_ok=True)
-    for f in tmp_dir.iterdir():
-        if f.suffix == ".mp4" and ".part" not in f.name:
-            try:
-                shutil.move(str(f), str(plex_dir / f.name))
-                moved += 1
-            except Exception:
-                pass
-        elif f.suffix in (".part", ".ytdl") or ".part-Frag" in f.name:
-            try:
-                f.unlink()
-                deleted += 1
-            except Exception:
-                pass
-    return moved, deleted
+def result_cell(value: str, downloaded: bool) -> str | Text:
+    """Grey a search cell when the video is already in the download log."""
+    if downloaded:
+        return Text(value, style="#8a8a8a")
+    return value
 
 
 def _render_ascii_thumbnail(image_bytes: bytes, width: int = 34) -> str:
@@ -193,676 +227,13 @@ def _render_ascii_thumbnail(image_bytes: bytes, width: int = 34) -> str:
     return "\n".join(lines)
 
 
-# ── Data model ────────────────────────────────────────────────────────────────
-@dataclass
-class Video:
-    id: str
-    title: str
-    duration_s: int
-    views: int
-    url: str
-    site: str
-    thumbnail_url: Optional[str] = None
-    rating_percent: Optional[int] = None
-    quality_p: Optional[int] = None
-    is_hd: Optional[bool] = None
-    selected: bool = False
-
-    @property
-    def duration_str(self) -> str:
-        m, s = divmod(self.duration_s, 60)
-        return f"{m}:{s:02d}"
-
-    @property
-    def views_str(self) -> str:
-        v = self.views
-        if v >= 1_000_000:
-            return f"{v/1_000_000:.1f}M"
-        if v >= 1_000:
-            return f"{v/1_000:.0f}K"
-        return str(v)
-
-
-@dataclass
-class DownloadJob:
-    video: Video
-    status: str = "queued"   # queued | downloading | paused | done | failed
-    progress: float = 0.0
-    speed: str = ""
-    eta: str = ""
-    filepath: Optional[Path] = None
-    file_size: int = 0
-    proc: Optional[subprocess.Popen] = None
-    worker_started: bool = False
-
-
-SortKey = Literal["title", "duration", "site", "views"]
-FileSortKey = Literal["name", "size", "modified", "path"]
-QualityFilter = Literal["any", "360", "480", "720", "1080"]
-
-
-@dataclass
-class SearchFilters:
-    min_duration_min: int = 0
-    max_duration_min: int = 0
-    min_quality: QualityFilter = "any"
-    min_rating: int = 0
-    hd_only: bool = False
-    pages: int = 2
-    exclude_phrases: str = DEFAULT_EXCLUDE_PHRASES
-
-    @property
-    def min_duration_s(self) -> int:
-        return max(0, self.min_duration_min) * 60
-
-    @property
-    def max_duration_s(self) -> int:
-        if self.max_duration_min <= 0:
-            return 24 * 60 * 60
-        return self.max_duration_min * 60
-
-
-@dataclass
-class AppSettings:
-    theme: str = "textual-dark"
-    thumbnails_enabled: bool = True
-    video_previews_enabled: bool = True
-    plex_dir: str = str(DEFAULT_OUTPUT_DIR)
-    tmp_dir: str = str(DEFAULT_TMP_DIR)
-    parallel_downloads: int = 3
-    search_filters: SearchFilters = field(default_factory=SearchFilters)
-
-    @property
-    def plex_path(self) -> Path:
-        return Path(self.plex_dir).expanduser()
-
-    @property
-    def tmp_path(self) -> Path:
-        return Path(self.tmp_dir).expanduser()
-
-
-@dataclass
-class FileEntry:
-    path: Path
-    size: int
-    modified_ts: float
-
-    @property
-    def name(self) -> str:
-        return self.path.name
-
-    @property
-    def modified_str(self) -> str:
-        return datetime.fromtimestamp(self.modified_ts).strftime("%Y-%m-%d %H:%M")
-
-
-# ── Porn search functions ────────────────────────────────────────────────────
-def _parse_dur(s: str) -> int:
-    parts = str(s).split(":")
-    try:
-        if len(parts) == 1:
-            return int(float(parts[0]))
-        if len(parts) == 2:
-            return int(parts[0]) * 60 + int(parts[1])
-        if len(parts) == 3:
-            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-    except Exception:
-        pass
-    return 0
-
-
-def _parse_percent(value: object) -> Optional[int]:
-    try:
-        text = str(value).strip().rstrip("%")
-        if not text:
-            return None
-        return max(0, min(100, int(float(text))))
-    except Exception:
-        return None
-
-
-def _parse_quality(value: object) -> Optional[int]:
-    if value is None:
-        return None
-    text = str(value).lower()
-    match = re.search(r"(\d{3,4})", text)
-    if match:
-        return int(match.group(1))
-    if text in {"hd", "true"}:
-        return 720
-    if text in {"sd", "false"}:
-        return 480
-    return None
-
-
-def search_pornhub(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
-    out, seen = [], set()
-    with httpx.Client(timeout=20, verify=False, headers=HEADERS) as c:
-        for page in range(1, pages + 1):
-            url = f"https://www.pornhub.com/webmasters/search?search={quote_plus(query)}&page={page}"
-            try:
-                for v in c.get(url).json().get("videos", []):
-                    vid = v.get("video_id", "")
-                    if not vid or vid in seen:
-                        continue
-                    seen.add(vid)
-                    dur = _parse_dur(v.get("duration", ""))
-                    if min_s <= dur <= max_s:
-                        hd = bool(v.get("hd"))
-                        out.append(Video(id=vid, title=v.get("title", ""),
-                            duration_s=dur, views=int(v.get("views", 0) or 0),
-                            url=f"https://www.pornhub.com/view_video.php?viewkey={vid}",
-                            site="PornHub",
-                            thumbnail_url=v.get("default_thumb") or v.get("thumb"),
-                            rating_percent=_parse_percent(v.get("rating")),
-                            quality_p=_parse_quality(v.get("quality")) or (720 if hd else 480),
-                            is_hd=hd))
-            except Exception:
-                pass
-    return out
-
-
-def _xh_parse(html: str) -> list[dict]:
-    idx = html.find('"videoThumbProps"')
-    if idx < 0:
-        return []
-    try:
-        start = html.index("[", idx)
-        depth = 0
-        for i, ch in enumerate(html[start:], start):
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    return json.loads(html[start:i+1].replace("\\/", "/"))
-    except Exception:
-        pass
-    return []
-
-
-def search_xhamster(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
-    out, seen = [], set()
-    slug = re.sub(r"\s+", "-", query.strip())
-    with httpx.Client(timeout=20, verify=False, headers=HEADERS, follow_redirects=True) as c:
-        for page in range(1, pages + 1):
-            url = f"https://xhamster.com/search/{slug}" + (f"?page={page}" if page > 1 else "")
-            try:
-                for v in _xh_parse(c.get(url).text):
-                    vid = str(v.get("id", ""))
-                    if not vid or vid in seen:
-                        continue
-                    seen.add(vid)
-                    dur = int(v.get("duration", 0))
-                    if min_s <= dur <= max_s:
-                        quality = _parse_quality(v.get("quality")) or _parse_quality(v.get("videoQuality"))
-                        hd_flag = v.get("isHD")
-                        out.append(Video(id=vid, title=v.get("title", ""),
-                            duration_s=dur, views=int(v.get("viewCount", 0) or 0),
-                            url=v.get("pageURL", "").replace("\\/", "/"),
-                            site="xHamster",
-                            thumbnail_url=(
-                                v.get("thumbURL")
-                                or v.get("thumbURL169")
-                                or v.get("imageURL")
-                            ),
-                            rating_percent=_parse_percent(v.get("rating")),
-                            quality_p=quality,
-                            is_hd=bool(hd_flag) if hd_flag is not None else (quality >= 720 if quality is not None else None)))
-            except Exception:
-                pass
-    return out
-
-
-def search_redtube(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
-    out, seen = [], set()
-    with httpx.Client(timeout=20, verify=False, headers=HEADERS) as c:
-        for page in range(1, pages + 1):
-            url = (f"https://api.redtube.com/?data=redtube.Videos.searchVideos"
-                   f"&search={quote_plus(query)}&output=json&page={page}&limit=20"
-                   f"&min_duration={min_s}&max_duration={max_s}")
-            try:
-                for entry in c.get(url).json().get("videos", []):
-                    v = entry.get("video", {})
-                    vid = str(v.get("video_id", ""))
-                    if not vid or vid in seen:
-                        continue
-                    seen.add(vid)
-                    dur = _parse_dur(str(v.get("duration", "0:00")))
-                    if min_s <= dur <= max_s:
-                        hd = bool(v.get("hd"))
-                        out.append(Video(id=vid, title=v.get("title", ""),
-                            duration_s=dur, views=int(v.get("views", 0) or 0),
-                            url=v.get("url", f"https://www.redtube.com/{vid}"),
-                            site="RedTube",
-                            thumbnail_url=v.get("default_thumb") or v.get("thumb"),
-                            rating_percent=_parse_percent(v.get("rating")),
-                            quality_p=_parse_quality(v.get("quality")) or (720 if hd else 480),
-                            is_hd=hd))
-            except Exception:
-                pass
-    return out
-
-
-def search_eporner(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
-    out, seen = [], set()
-    with httpx.Client(timeout=20, verify=False, headers=HEADERS) as c:
-        for page in range(1, pages + 1):
-            url = (f"https://www.eporner.com/api/v2/video/search/"
-                   f"?query={quote_plus(query)}&per_page=20&page={page}"
-                   f"&min_duration={min_s}&max_duration={max_s}&format=json")
-            try:
-                for v in c.get(url).json().get("videos", []):
-                    vid = str(v.get("id", ""))
-                    if not vid or vid in seen:
-                        continue
-                    seen.add(vid)
-                    dur = int(v.get("length_sec", 0))
-                    raw_url = v.get("url", "")
-                    if not raw_url:
-                        raw_url = f"https://www.eporner.com/video-{vid}/"
-                    elif not raw_url.startswith("http"):
-                        raw_url = "https://www.eporner.com" + raw_url
-                    if min_s <= dur <= max_s:
-                        quality = _parse_quality(v.get("quality"))
-                        out.append(Video(id=vid, title=v.get("title", ""),
-                            duration_s=dur, views=int(v.get("views", 0) or 0),
-                            url=raw_url, site="Eporner",
-                            thumbnail_url=v.get("default_thumb") or v.get("thumb"),
-                            rating_percent=_parse_percent(v.get("rate") or v.get("rating")),
-                            quality_p=quality,
-                            is_hd=(quality >= 720) if quality is not None else None))
-            except Exception:
-                pass
-    return out
-
-
-SITE_FN = {
-    "PornHub":  search_pornhub,
-    "xHamster": search_xhamster,
-    "RedTube":  search_redtube,
-    "Eporner":  search_eporner,
-}
-
-
-def filter_video(video: Video, filters: SearchFilters) -> bool:
-    if video.duration_s < filters.min_duration_s:
-        return False
-    if filters.max_duration_min > 0 and video.duration_s > filters.max_duration_s:
-        return False
-    if filters.min_rating > 0 and video.rating_percent is not None and video.rating_percent < filters.min_rating:
-        return False
-    if filters.hd_only and video.is_hd is False:
-        return False
-    if filters.min_quality != "any":
-        min_quality = int(filters.min_quality)
-        if video.quality_p is not None and video.quality_p < min_quality:
-            return False
-        if video.quality_p is None and video.is_hd is False and min_quality >= 720:
-            return False
-    title_lower = video.title.lower()
-    for phrase in _split_exclude_phrases(filters.exclude_phrases):
-        if phrase in title_lower:
-            return False
-    return True
-
-
-def dedupe_videos(videos: list[Video]) -> list[Video]:
-    seen_ids: set[str] = set()
-    seen_titles: set[str] = set()
-    unique: list[Video] = []
-    for video in videos:
-        norm = _normalize_title(video.title)
-        if video.id in seen_ids:
-            continue
-        if norm and norm in seen_titles:
-            continue
-        seen_ids.add(video.id)
-        if norm:
-            seen_titles.add(norm)
-        unique.append(video)
-    return unique
-
-
-def _job_temp_dir(tmp_dir: Path, video: Video) -> Path:
-    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", video.id or video.title).strip("-") or "job"
-    return tmp_dir / slug[:80]
-
-
-def search_videos(query: str, site: str, filters: SearchFilters, twitter_count: int = 40) -> list[Video]:
-    if site == "Twitter":
-        return dedupe_videos(search_twitter(query, twitter_count, TWITTER_COOKIES))
-
-    sites = list(SITE_FN) if site == "All Sites" else [site]
-    results: list[Video] = []
-    for name in sites:
-        found = SITE_FN[name](query, filters.min_duration_s, filters.max_duration_s, filters.pages)
-        results.extend(video for video in found if filter_video(video, filters))
-    return dedupe_videos(results)
-
-
-def video_to_dict(video: Video) -> dict[str, object]:
-    return {
-        "id": video.id,
-        "title": video.title,
-        "site": video.site,
-        "duration_seconds": video.duration_s,
-        "duration": video.duration_str,
-        "views": video.views,
-        "url": video.url,
-        "rating_percent": video.rating_percent,
-        "quality_p": video.quality_p,
-        "is_hd": video.is_hd,
-    }
-
-
-def build_filters_from_args(args: Namespace, settings: AppSettings) -> SearchFilters:
-    base = settings.search_filters
-    return SearchFilters(
-        min_duration_min=args.min_duration if args.min_duration is not None else base.min_duration_min,
-        max_duration_min=args.max_duration if args.max_duration is not None else base.max_duration_min,
-        min_quality=args.min_quality if args.min_quality is not None else base.min_quality,
-        min_rating=args.min_rating if args.min_rating is not None else base.min_rating,
-        hd_only=args.hd_only if getattr(args, "hd_only", False) else base.hd_only,
-        pages=args.pages if args.pages is not None else base.pages,
-        exclude_phrases=args.exclude if args.exclude is not None else base.exclude_phrases,
-    )
-
-
-def normalize_download_target(target: str, site: str) -> tuple[str, str]:
-    if re.match(r"^https?://", target):
-        return target, target
-    if site == "PornHub":
-        return target, f"https://www.pornhub.com/view_video.php?viewkey={target}"
-    return target, target
-
-
-def build_download_video(target: str, site: str) -> Video:
-    video_id, url = normalize_download_target(target, site)
-    return Video(
-        id=video_id,
-        title=target,
-        duration_s=0,
-        views=0,
-        url=url,
-        site=site,
-    )
-
-
-# ── Twitter/X search via headless Chrome + network capture ───────────────────
-def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
-    """Search Twitter Media tab using headless Chrome, capture GraphQL responses."""
-    import time as _time
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-
-    # Load auth_token from cookies file
-    if cookies_file.exists():
-        try:
-            cdata = json.loads(cookies_file.read_text())
-            auth_token = cdata.get("auth_token", "")
-        except Exception:
-            auth_token = ""
-    else:
-        return []
-
-    if not auth_token:
-        return []
-
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-
-    driver = webdriver.Chrome(options=opts)
-    out: list[Video] = []
-    seen: set[str] = set()
-
-    try:
-        # Set auth cookie
-        driver.get("https://x.com")
-        _time.sleep(2)
-        driver.add_cookie({
-            "name": "auth_token", "value": auth_token,
-            "domain": ".x.com", "path": "/",
-        })
-
-        # Search media tab
-        from urllib.parse import quote_plus as _qp
-        driver.get(f"https://x.com/search?q={_qp(query)}&f=media")
-        _time.sleep(6)
-
-        # Scroll to load more results
-        scrolls = max(1, count // 40)
-        for _ in range(scrolls):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-            _time.sleep(3)
-
-        # Parse network logs for SearchTimeline responses
-        logs = driver.get_log("performance")
-        for entry in logs:
-            msg = json.loads(entry["message"])["message"]
-            if msg["method"] != "Network.responseReceived":
-                continue
-            url = msg["params"]["response"]["url"]
-            if "SearchTimeline" not in url:
-                continue
-            if msg["params"]["response"]["status"] != 200:
-                continue
-
-            req_id = msg["params"]["requestId"]
-            try:
-                body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": req_id})
-                data = json.loads(body["body"])
-            except Exception:
-                continue
-
-            instructions = (data.get("data", {})
-                           .get("search_by_raw_query", {})
-                           .get("search_timeline", {})
-                           .get("timeline", {})
-                           .get("instructions", []))
-
-            for inst in instructions:
-                # Collect items from grid entries and moduleItems
-                items: list[dict] = []
-                for e in inst.get("entries", []):
-                    content = e.get("content", {})
-                    items.extend(content.get("items", []))
-                items.extend(inst.get("moduleItems", []))
-
-                for it in items:
-                    result = (it.get("item", {})
-                             .get("itemContent", {})
-                             .get("tweet_results", {})
-                             .get("result", {}))
-
-                    if result.get("__typename") == "TweetWithVisibilityResults":
-                        result = result.get("tweet", {})
-
-                    tid = result.get("rest_id", "")
-                    if not tid or tid in seen:
-                        continue
-                    seen.add(tid)
-
-                    legacy = result.get("legacy", {})
-                    user_legacy = (result.get("core", {})
-                                  .get("user_results", {})
-                                  .get("result", {})
-                                  .get("legacy", {}))
-
-                    user_result = (result.get("core", {})
-                                  .get("user_results", {})
-                                  .get("result", {}))
-                    user_core = user_result.get("core", {})
-                    sn = (user_core.get("screen_name", "")
-                          or user_legacy.get("screen_name", "")
-                          or user_result.get("rest_id", ""))
-                    text = legacy.get("full_text", "")[:120].replace("\n", " ")
-                    title = f"@{sn}: {text}" if sn else text
-
-                    # Check for video media
-                    media = legacy.get("extended_entities", {}).get("media", [])
-                    has_vid = any(m.get("type") == "video" for m in media)
-                    dur_ms = 0
-                    for m in media:
-                        if m.get("type") == "video":
-                            dur_ms = m.get("video_info", {}).get("duration_millis", 0)
-                    thumb_url = ""
-                    for m in media:
-                        if m.get("type") == "video":
-                            thumb_url = m.get("media_url_https") or m.get("media_url", "")
-                            break
-
-                    views_raw = result.get("views", {}).get("count", "0")
-                    views = int(views_raw) if str(views_raw).isdigit() else 0
-                    likes = legacy.get("favorite_count", 0)
-
-                    out.append(Video(
-                        id=tid,
-                        title=title,
-                        duration_s=dur_ms // 1000,
-                        views=views if views else likes,
-                        url=f"https://x.com/{sn}/status/{tid}",
-                        site="Twitter",
-                        thumbnail_url=thumb_url,
-                    ))
-    except Exception:
-        pass
-    finally:
-        driver.quit()
-
-    return out
-
-
-# ── Download worker (runs in thread) ─────────────────────────────────────────
-def run_download(job: DownloadJob, tmp_dir: Path, plex_dir: Path, progress_cb, done_cb) -> None:
-    """Execute yt-dlp, parse progress into job fields, move file to plex."""
-    job.status = "downloading"
-    job_tmp_dir = _job_temp_dir(tmp_dir, job.video)
-    job_tmp_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        str(YTDLP),
-        "-o", str(job_tmp_dir / "%(title)s.%(ext)s"),
-        "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-        "--merge-output-format", "mp4",
-        "--no-playlist", "--newline", "--no-warnings",
-        "--retries", "3", "--fragment-retries", "5",
-        "--print", "after_move:__FETCHER_DEST__:%(filepath)s",
-    ]
-    # Twitter NSFW videos require authenticated cookies
-    if job.video.site == "Twitter":
-        cmd.extend(["--cookies-from-browser", "chrome"])
-    cmd.append(job.video.url)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, start_new_session=True)
-    job.proc = proc
-    progress_cb()
-
-    dest: Optional[Path] = None
-    pct_re   = re.compile(r"\[download\]\s+([\d.]+)%.*?at\s+([\d.]+\s*\S+).*?ETA\s+(\S+)")
-    done_re  = re.compile(r"\[download\]\s+100%\s+of")
-    dest_re  = re.compile(r"\[download\] Destination: (.+)")
-    merge_re = re.compile(r'\[Merger\] Merging formats into "(.+)"')
-    print_re = re.compile(r"__FETCHER_DEST__:(.+)")
-    tail = deque(maxlen=12)
-
-    for line in proc.stdout or []:
-        line = line.rstrip()
-        if line:
-            tail.append(line)
-        if m := pct_re.search(line):
-            job.progress = float(m.group(1))
-            job.speed    = m.group(2)
-            job.eta      = m.group(3)
-            progress_cb()
-        elif done_re.search(line):
-            job.progress = 100.0
-            job.speed    = ""
-            job.eta      = ""
-            progress_cb()
-        elif m := dest_re.search(line):
-            dest = Path(m.group(1).strip())
-        elif m := merge_re.search(line):
-            dest = Path(m.group(1).strip().strip('"'))
-        elif m := print_re.search(line):
-            dest = Path(m.group(1).strip())
-
-    proc.wait()
-    job.proc = None
-
-    if proc.returncode == 0:
-        if not (dest and dest.exists()):
-            candidates = sorted(job_tmp_dir.rglob("*.mp4"),
-                                key=lambda p: p.stat().st_mtime, reverse=True)
-            dest = candidates[0] if candidates else None
-
-        if dest and dest.exists():
-            target = plex_dir / dest.name
-            try:
-                shutil.move(str(dest), str(target))
-                job.filepath  = target
-                job.file_size = target.stat().st_size
-                job.status    = "done"
-                job.progress  = 100.0
-                with open(DOWNLOADED_IDS, "a") as f:
-                    f.write(job.video.id + "\n")
-            except Exception as e:
-                job.status = "failed"
-                job.eta    = str(e)
-        else:
-            job.status = "failed"
-            job.eta    = "no output file found"
-    else:
-        job.status = "failed"
-        failure_lines = [
-            line for line in reversed(tail)
-            if line and not line.startswith("[download]")
-        ]
-        job.eta = failure_lines[0] if failure_lines else f"exit {proc.returncode}"
-
-    try:
-        if job_tmp_dir.exists() and not any(job_tmp_dir.iterdir()):
-            job_tmp_dir.rmdir()
-    except OSError:
-        pass
-
-    done_cb(job)
-
-
-def resolve_stream_urls(video: Video) -> tuple[list[str], Optional[str]]:
-    """Resolve direct media URLs for mpv without relying on mpv's yt-dlp hook."""
-    cmd = [
-        str(YTDLP),
-        "-g",
-        "--no-playlist",
-        "-f",
-        "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-    ]
-    if video.site == "Twitter":
-        cmd.extend(["--cookies-from-browser", "chrome"])
-    cmd.append(video.url)
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-    except Exception as exc:
-        return [], str(exc)
-
-    urls = [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("http")]
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout).strip() or f"yt-dlp exit {proc.returncode}"
-        return urls, err
-    if not urls:
-        return [], "yt-dlp returned no playable media URL"
-    return urls, None
+def _file_preview_text(entry: FileEntry) -> Text:
+    text = Text()
+    text.append(entry.name, style="bold")
+    text.append(f"\nSize: {_fmt_size(entry.size)}\n")
+    text.append(f"Modified: {entry.modified_str}\n")
+    text.append(str(entry.path), style="dim")
+    return text
 
 
 def print_results_table(results: list[Video], limit: Optional[int] = None) -> None:
@@ -874,30 +245,6 @@ def print_results_table(results: list[Video], limit: Optional[int] = None) -> No
         duration = video.duration_str if video.duration_s else "—"
         print(f"{idx:>3}. [{video.site}] {duration:>6}  {video.views_str:>6}  {video.title}")
         print(f"     {video.url}")
-
-
-def download_one(video: Video, tmp_dir: Path, output_dir: Path) -> DownloadJob:
-    job = DownloadJob(video=video)
-
-    def progress_cb() -> None:
-        return
-
-    def done_cb(_: DownloadJob) -> None:
-        return
-
-    run_download(job, tmp_dir, output_dir, progress_cb, done_cb)
-    return job
-
-
-def run_batch_download(videos: list[Video], tmp_dir: Path, output_dir: Path, parallel: int) -> list[DownloadJob]:
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    jobs: list[DownloadJob] = []
-    with ThreadPoolExecutor(max_workers=max(1, parallel)) as executor:
-        futures = {executor.submit(download_one, video, tmp_dir, output_dir): video for video in videos}
-        for future in as_completed(futures):
-            jobs.append(future.result())
-    return jobs
 
 
 def summarize_job(job: DownloadJob) -> str:
@@ -1052,11 +399,13 @@ class HelpScreen(ModalScreen):
                 "[bold cyan]FetchTUI[/]\n\n"
                 "[yellow]Search[/]\n"
                 "  Enter / Search    Run search\n"
+                "  Clear             Clear the query, results, and in-flight search\n"
                 "  Click headers     Sort by name / duration / source / views\n"
                 "  Site dropdown     PornHub · xHamster · RedTube · Eporner · All\n"
                 "  Min/Max/Pages     Duration filter (min) & result depth\n"
                 "  Parallel          Max simultaneous downloads\n"
-                "  Hide downloaded   Skip already-grabbed videos\n\n"
+                "  Hide downloaded   Omit videos already in the download log\n"
+                "                    Uncheck to show those rows in grey\n\n"
                 "[yellow]Selection[/]\n"
                 "  Space / Enter     Toggle row selection\n"
                 "  a                 Select all results\n"
@@ -1065,7 +414,7 @@ class HelpScreen(ModalScreen):
                 "  d                 Download selected\n"
                 "  p                 Play highlighted result in mpv\n"
                 "  S                 Stop all active downloads\n"
-                "  x                 Clean tmp/ (move mp4, delete partials)\n"
+                "  x                 Clean tmp/ (move media, delete partials)\n"
                 "  ↻ button          Retry a failed download\n\n"
                 "[yellow]Files[/]\n"
                 "  Files tab         Browse the configured output directory\n"
@@ -1073,7 +422,8 @@ class HelpScreen(ModalScreen):
                 "  Play file         Open highlighted local file\n\n"
                 "[yellow]Twitter[/]\n"
                 "  Requires login (username + password) — cookies saved locally\n"
-                "  Search returns video tweets only\n\n"
+                "  Search returns video tweets only\n"
+                "  Clear             Clear the Twitter query and results\n\n"
                 "[yellow]Other[/]\n"
                 "  ?   Help    q   Quit (confirms if downloads active)\n",
                 markup=True,
@@ -1107,60 +457,6 @@ class QuitScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-# ── Twitter login modal ──────────────────────────────────────────────────────
-class TwitterLoginScreen(ModalScreen[str]):
-    BINDINGS = [Binding("escape", "dismiss_cancel", "Cancel")]
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="tw-login-box"):
-            yield Static(
-                "[bold cyan]Twitter/X Auth[/]\n\n"
-                "Paste your [bold]auth_token[/] from Chrome DevTools:\n"
-                "  F12 → Application → Cookies → x.com → auth_token\n\n"
-                "Or paste full cookies JSON:\n"
-                '  [dim]{"auth_token":"abc…"}[/]\n',
-                markup=True,
-            )
-            yield Label("auth_token (or JSON):")
-            yield Input(placeholder="49be93f66eafc…  or  {\"auth_token\":\"…\"}", id="tw-token")
-            yield Static("", id="tw-login-status")
-            with Horizontal(id="tw-login-buttons"):
-                yield Button("Save", variant="primary", name="save")
-                yield Button("Cancel", variant="default", name="cancel")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.name == "cancel":
-            self.dismiss("")
-        elif event.button.name == "save":
-            raw = self.query_one("#tw-token", Input).value.strip()
-            if not raw:
-                self.query_one("#tw-login-status", Static).update("[red]Paste a token[/]")
-                return
-
-            # Try as JSON first
-            if raw.startswith("{"):
-                try:
-                    cookies = json.loads(raw)
-                    if not isinstance(cookies, dict) or "auth_token" not in cookies:
-                        raise ValueError("JSON must contain auth_token key")
-                    TWITTER_COOKIES.write_text(json.dumps(cookies, indent=2))
-                    self.dismiss("Cookies saved.")
-                    return
-                except (json.JSONDecodeError, ValueError) as e:
-                    self.query_one("#tw-login-status", Static).update(f"[red]{e}[/]")
-                    return
-
-            # Treat as raw auth_token value
-            if len(raw) < 20:
-                self.query_one("#tw-login-status", Static).update("[red]Token too short[/]")
-                return
-            TWITTER_COOKIES.write_text(json.dumps({"auth_token": raw}, indent=2))
-            self.dismiss("auth_token saved.")
-
-    def action_dismiss_cancel(self) -> None:
-        self.dismiss("")
-
-
 class SearchFilterScreen(ModalScreen[Optional[SearchFilters]]):
     BINDINGS = [Binding("escape", "dismiss_cancel", "Cancel")]
 
@@ -1185,15 +481,20 @@ class SearchFilterScreen(ModalScreen[Optional[SearchFilters]]):
             with Horizontal(classes="settings-row"):
                 yield Label("Min Quality")
                 yield Select(
-                    [("Any", "any"), ("360p+", "360"), ("480p+", "480"), ("720p+", "720"), ("1080p+", "1080")],
+                    [("720p+", "720"), ("1080p+", "1080")],
                     id="filter-min-quality",
                     allow_blank=False,
-                    value=self._filters.min_quality,
+                    value=normalize_min_quality(self._filters.min_quality),
                 )
             with Horizontal(classes="settings-row"):
                 yield Label("Min Rating %")
                 yield Input(str(self._filters.min_rating), id="filter-min-rating", type="integer")
             yield Checkbox("HD only", value=self._filters.hd_only, id="filter-hd-only")
+            yield Checkbox(
+                "Filter censored / mosaic uploads (Eporner)",
+                value=self._filters.exclude_censored,
+                id="filter-exclude-censored",
+            )
             with Horizontal(classes="settings-row"):
                 yield Label("Search Pages")
                 yield Input(str(self._filters.pages), id="filter-pages", type="integer")
@@ -1223,9 +524,10 @@ class SearchFilterScreen(ModalScreen[Optional[SearchFilters]]):
         self.dismiss(SearchFilters(
             min_duration_min=min_duration,
             max_duration_min=max_duration,
-            min_quality=str(self.query_one("#filter-min-quality", Select).value or "any"),  # type: ignore[arg-type]
+            min_quality=normalize_min_quality(self.query_one("#filter-min-quality", Select).value),
             min_rating=min_rating,
             hd_only=self.query_one("#filter-hd-only", Checkbox).value,
+            exclude_censored=self.query_one("#filter-exclude-censored", Checkbox).value,
             pages=pages,
             exclude_phrases=self.query_one("#filter-exclude-phrases", Input).value.strip() or DEFAULT_EXCLUDE_PHRASES,
         ))
@@ -1249,7 +551,7 @@ class FetchTUI(App):
     }
     #site-select  { width: 18; margin: 0 1; }
     #search-input { width: 1fr; margin: 0 1; }
-    #btn-search, #btn-filters { min-width: 10; margin: 0 1; }
+    #btn-search, #btn-filters, #btn-clear { min-width: 10; margin: 0 1; }
 
     #porn-filter-bar {
         height: auto; padding: 0 1;
@@ -1315,7 +617,7 @@ class FetchTUI(App):
         background: $panel; layout: horizontal;
     }
     #tw-search-input { width: 1fr; margin: 0 1; }
-    #tw-btn-search   { min-width: 10; margin: 0 1; }
+    #tw-btn-search, #tw-btn-clear { min-width: 10; margin: 0 1; }
     #tw-btn-login    { min-width: 10; margin: 0 1; }
 
     #tw-filter-bar {
@@ -1409,6 +711,9 @@ class FetchTUI(App):
     .settings-row Input, .settings-row Select {
         width: 1fr;
     }
+    .settings-hint { color: $text-muted; height: auto; margin: 0 0 1 0; }
+    #settings-scroll .provider-signin { min-width: 9; margin: 0 1 0 0; }
+    #settings-scroll .provider-test { min-width: 6; margin: 0 1 0 0; }
     #settings-actions { height: auto; }
     #settings-actions Button { margin: 0 1 0 0; }
     #settings-status { color: $text-muted; }
@@ -1434,15 +739,6 @@ class FetchTUI(App):
     }
     #quit-buttons { height: auto; }
     #quit-buttons Button { margin: 1 2; }
-
-    #tw-login-box {
-        width: 50; height: auto;
-        border: solid cyan; background: $panel;
-        padding: 2 4; margin: 6 12;
-    }
-    #tw-cookies { width: 1fr; }
-    #tw-login-buttons { height: auto; }
-    #tw-login-buttons Button { margin: 1 2; }
 
     #filter-box {
         width: 56; height: auto;
@@ -1472,10 +768,7 @@ class FetchTUI(App):
     def __init__(self) -> None:
         super().__init__()
         self.settings = load_settings()
-        self._tmp_dir = self.settings.tmp_path
-        self._plex_dir = self.settings.plex_path
-        self._tmp_dir.mkdir(parents=True, exist_ok=True)
-        self._plex_dir.mkdir(parents=True, exist_ok=True)
+        self._tmp_dir, self._plex_dir, self._startup_warnings = resolve_runtime_dirs(self.settings)
         # Shared state
         ids, titles = load_downloaded(self._plex_dir)
         self._downloaded:        set[str] = ids
@@ -1485,15 +778,21 @@ class FetchTUI(App):
         self._download_parallel: int = max(1, self.settings.parallel_downloads)
 
     # Porn tab state
+        self._porn_matches: list[Video] = []
         self._porn_results: list[Video] = []
         self._porn_dl_count: int = 0
         self._porn_sort_key: SortKey = "views"
         self._porn_sort_reverse: bool = True
+        self._porn_search_generation: int = 0
+        self._porn_search_cancel = threading.Event()
 
         # Twitter tab state
+        self._tw_matches: list[Video] = []
         self._tw_results: list[Video] = []
+        self._tw_search_generation: int = 0
+        self._tw_search_cancel = threading.Event()
         self._tw_dl_count: int = 0
-        self._tw_logged_in: bool = TWITTER_COOKIES.exists()
+        self._tw_logged_in: bool = provider_login.twitter_authenticated()
         self._tw_sort_key: SortKey = "views"
         self._tw_sort_reverse: bool = True
 
@@ -1520,12 +819,13 @@ class FetchTUI(App):
                     yield Input(placeholder="Search (e.g. bbc creampie)…", id="search-input")
                     yield Button("Filters", variant="default", id="btn-filters")
                     yield Button("Search", variant="primary", id="btn-search")
+                    yield Button("Clear", id="btn-clear")
 
                 with Horizontal(id="porn-filter-bar"):
                     yield Label("", id="filter-summary")
                     yield Label("Parallel:")
                     yield Input("3", id="parallel", type="integer")
-                    yield Checkbox("Hide dl'd", value=True, id="hide-dl")
+                    yield Checkbox("Hide downloaded", value=True, id="hide-dl")
                     yield Label("", id="result-count")
 
                 yield DataTable(id="results-table", cursor_type="row", zebra_stripes=True)
@@ -1554,13 +854,14 @@ class FetchTUI(App):
                 with Horizontal(id="tw-search-bar"):
                     yield Input(placeholder="Search Twitter (e.g. nsfw video)…", id="tw-search-input")
                     yield Button("Search", variant="primary", id="tw-btn-search")
+                    yield Button("Clear", id="tw-btn-clear")
                     login_label = "✓ Logged in" if self._tw_logged_in else "Login"
                     yield Button(login_label, variant="success" if self._tw_logged_in else "warning", id="tw-btn-login")
 
                 with Horizontal(id="tw-filter-bar"):
                     yield Label("Results:")
                     yield Input("40", id="tw-count", type="integer")
-                    yield Checkbox("Hide dl'd", value=True, id="tw-hide-dl")
+                    yield Checkbox("Hide downloaded", value=True, id="tw-hide-dl")
                     yield Label("", id="tw-result-count")
                     yield Label("", id="tw-login-status")
 
@@ -1612,6 +913,36 @@ class FetchTUI(App):
                         with Horizontal(classes="settings-row"):
                             yield Label("Parallel Downloads")
                             yield Input(id="settings-parallel", type="integer")
+                        with Horizontal(classes="settings-row"):
+                            yield Label("Minimum Download Height (0 = no minimum)")
+                            yield Input(id="settings-min-height", type="integer")
+                    with Vertical(classes="settings-section"):
+                        yield Static("[bold]Provider Sign-ins[/]", markup=True)
+                        yield Static(
+                            "Sign-in opens a Chrome window; log in there, then close "
+                            "the window. Session cookies are stored owner-only under "
+                            ".fetcher/cookies and used for search, downloads, and previews.",
+                            classes="settings-hint",
+                        )
+                        for _signin_site in provider_login.SIGN_IN_SITES:
+                            with Horizontal(classes="settings-row"):
+                                yield Label(_signin_site)
+                                yield Static("", id=f"settings-signin-{_signin_site.lower()}")
+                                yield Button(
+                                    "Sign in",
+                                    id=f"btn-signin-{_signin_site.lower()}",
+                                    classes="provider-signin",
+                                )
+                                yield Button(
+                                    "Test",
+                                    id=f"btn-test-{_signin_site.lower()}",
+                                    classes="provider-test",
+                                )
+                                yield Button(
+                                    "Sign out",
+                                    id=f"btn-signout-{_signin_site.lower()}",
+                                    classes="provider-signin",
+                                )
                     with Horizontal(id="settings-actions"):
                         yield Button("Save Settings", variant="primary", id="btn-settings-save")
                         yield Button("Reload Settings", variant="default", id="btn-settings-reload")
@@ -1628,6 +959,7 @@ class FetchTUI(App):
         self._configure_twitter_table()
         self._configure_files_table()
         self._populate_settings_controls()
+        self._refresh_provider_signin_status()
         self._refresh_filter_summary()
         self._refresh_player_status()
         self._load_files()
@@ -1635,14 +967,17 @@ class FetchTUI(App):
         self.query_one("#files-path", Static).update(str(self._plex_dir))
 
         self._log(f"Ready. {len(self._downloaded)} known downloads.")
+        for warning in self._startup_warnings:
+            self._log(warning)
+            self._set_settings_status(warning)
         if self._tw_logged_in:
             self._log("Twitter: cookies loaded.")
         else:
-            self._log("Twitter: not logged in — click Login to authenticate.")
+            self._log("Twitter: not logged in — click Login for browser sign-in.")
 
         moved, deleted = cleanup_tmp(self._tmp_dir, self._plex_dir)
         if moved or deleted:
-            self._log(f"tmp/ cleanup: {moved} mp4 moved to plex, {deleted} partials deleted.")
+            self._log(f"tmp/ cleanup: {moved} media file(s) moved to plex, {deleted} partials deleted.")
 
     def _log(self, msg: str) -> None:
         self.query_one("#app-log", Log).write_line(msg)
@@ -1657,9 +992,10 @@ class FetchTUI(App):
         theme_select.value = self.settings.theme
         self.query_one("#settings-thumbnails", Checkbox).value = self.settings.thumbnails_enabled
         self.query_one("#settings-video-previews", Checkbox).value = self.settings.video_previews_enabled
-        self.query_one("#settings-plex-dir", Input).value = str(self._plex_dir)
-        self.query_one("#settings-tmp-dir", Input).value = str(self._tmp_dir)
+        self.query_one("#settings-plex-dir", Input).value = self.settings.plex_dir
+        self.query_one("#settings-tmp-dir", Input).value = self.settings.tmp_dir
         self.query_one("#settings-parallel", Input).value = str(self.settings.parallel_downloads)
+        self.query_one("#settings-min-height", Input).value = str(self.settings.min_download_height)
         self._set_settings_status("")
 
     def _filter_summary_text(self) -> str:
@@ -1708,7 +1044,9 @@ class FetchTUI(App):
         norm = _normalize_title(video.title)
         if not self._plex_dir.exists():
             return None
-        for path in self._plex_dir.glob("*.mp4"):
+        for path in self._plex_dir.iterdir():
+            if path.suffix.lower() not in MEDIA_EXTENSIONS:
+                continue
             if _normalize_title(path.stem) == norm:
                 return path
         return None
@@ -1753,7 +1091,7 @@ class FetchTUI(App):
             self.call_from_thread(self._update_thumbnail_widget, "[dim]No thumbnail available.[/]")
             return
         try:
-            with httpx.Client(timeout=15, verify=False, headers=HEADERS) as client:
+            with httpx.Client(timeout=15, headers=HEADERS) as client:
                 response = client.get(video.thumbnail_url)
                 response.raise_for_status()
             thumb = _render_ascii_thumbnail(response.content)
@@ -1876,7 +1214,7 @@ class FetchTUI(App):
             try:
                 self._player_proc.terminate()
             except Exception:
-                pass
+                logger.debug("failed to terminate player process", exc_info=True)
             self._player_proc = None
             if log_message:
                 self._log("■ player stopped")
@@ -1954,49 +1292,112 @@ class FetchTUI(App):
             return str(path)
 
     def _video_matches_search_filters(self, video: Video) -> bool:
-        filters = self.settings.search_filters
-        if video.duration_s < filters.min_duration_s:
-            return False
-        if filters.max_duration_min > 0 and video.duration_s > filters.max_duration_s:
-            return False
-        if filters.min_rating > 0 and video.rating_percent is not None and video.rating_percent < filters.min_rating:
-            return False
-        if filters.hd_only and video.is_hd is False:
-            return False
-        if filters.min_quality != "any":
-            min_quality = int(filters.min_quality)
-            if video.quality_p is not None and video.quality_p < min_quality:
-                return False
-            if video.quality_p is None and video.is_hd is False and min_quality >= 720:
-                return False
-        title_lower = video.title.lower()
-        for phrase in _split_exclude_phrases(filters.exclude_phrases):
-            if phrase in title_lower:
-                return False
-        return True
+        return video_matches_filters(video, self.settings.search_filters)
 
-    def _render_porn_results(self) -> None:
+    def _downloaded_row(self, video: Video) -> bool:
+        return video_is_downloaded(video, self._downloaded, self._downloaded_titles)
+
+    def _cursor_video_id(self, table_id: str, results: list[Video]) -> Optional[str]:
+        try:
+            row = self.query_one(table_id, DataTable).cursor_row
+        except Exception:
+            return None
+        if results and 0 <= row < len(results):
+            return results[row].id
+        return None
+
+    def _place_result_cursor(self, table: DataTable, results: list[Video], keep_id: Optional[str], *, active: bool) -> None:
+        if not results:
+            if active:
+                self._set_player_target(None)
+            return
+        index = 0
+        if keep_id:
+            for row, video in enumerate(results):
+                if video.id == keep_id:
+                    index = row
+                    break
+        table.move_cursor(row=index, animate=False)
+        if active:
+            self._set_player_target(results[index])
+
+    def _refresh_porn_display(self, *, keep_cursor: bool = True, status_suffix: str = "") -> None:
+        keep_id = self._cursor_video_id("#results-table", self._porn_results) if keep_cursor else None
+        hide = self.query_one("#hide-dl", Checkbox).value
+        visible = without_downloaded(self._porn_matches, self._downloaded, self._downloaded_titles) if hide else list(self._porn_matches)
+        hidden = len(self._porn_matches) - len(visible)
+        self._porn_results = visible
+        self._render_porn_results(keep_id)
+        label = f"  {len(visible)} results"
+        if hidden:
+            label += f"  ({hidden} downloaded hidden)"
+        if status_suffix:
+            label += f"  {status_suffix}"
+        self.query_one("#result-count", Label).update(label)
+
+    def _refresh_twitter_display(self, *, keep_cursor: bool = True, status_suffix: str = "") -> None:
+        keep_id = self._cursor_video_id("#tw-results-table", self._tw_results) if keep_cursor else None
+        hide = self.query_one("#tw-hide-dl", Checkbox).value
+        visible = without_downloaded(self._tw_matches, self._downloaded, self._downloaded_titles) if hide else list(self._tw_matches)
+        hidden = len(self._tw_matches) - len(visible)
+        self._tw_results = visible
+        self._render_twitter_results(keep_id)
+        label = f"  {len(visible)} results"
+        if hidden:
+            label += f"  ({hidden} downloaded hidden)"
+        if status_suffix:
+            label += f"  {status_suffix}"
+        self.query_one("#tw-result-count", Label).update(label)
+
+    def _refresh_download_marks(self, video: Video) -> None:
+        if video.site == "Twitter":
+            if self._tw_matches:
+                self._refresh_twitter_display()
+            return
+        if self._porn_matches:
+            self._refresh_porn_display()
+
+    @on(Checkbox.Changed, "#hide-dl")
+    def _porn_hide_downloaded_changed(self, _event: Checkbox.Changed) -> None:
+        if self._porn_matches:
+            self._refresh_porn_display()
+
+    @on(Checkbox.Changed, "#tw-hide-dl")
+    def _twitter_hide_downloaded_changed(self, _event: Checkbox.Changed) -> None:
+        if self._tw_matches:
+            self._refresh_twitter_display()
+
+    def _render_porn_results(self, keep_id: Optional[str] = None) -> None:
         self._configure_porn_table()
         table = self.query_one("#results-table", DataTable)
         for i, v in enumerate(self._porn_results):
-            table.add_row("☐" if not v.selected else "☑", v.site, v.title[:62], v.duration_str, v.views_str, key=str(i))
-        if self._porn_results:
-            table.move_cursor(row=0, animate=False)
-            self._set_player_target(self._porn_results[0])
-        else:
-            self._set_player_target(None)
+            downloaded = self._downloaded_row(v)
+            mark = "☑" if v.selected else "☐"
+            table.add_row(
+                result_cell(mark, downloaded),
+                result_cell(v.site, downloaded),
+                result_cell(v.title[:62], downloaded),
+                result_cell(v.duration_str, downloaded),
+                result_cell(v.views_str, downloaded),
+                key=str(i),
+            )
+        self._place_result_cursor(table, self._porn_results, keep_id, active=self._active_tab() == "porn")
 
-    def _render_twitter_results(self) -> None:
+    def _render_twitter_results(self, keep_id: Optional[str] = None) -> None:
         self._configure_twitter_table()
         table = self.query_one("#tw-results-table", DataTable)
         for i, v in enumerate(self._tw_results):
+            downloaded = self._downloaded_row(v)
+            mark = "☑" if v.selected else "☐"
             dur = v.duration_str if v.duration_s > 0 else "—"
-            table.add_row("☐" if not v.selected else "☑", v.title[:72], dur, v.views_str, key=str(i))
-        if self._tw_results:
-            table.move_cursor(row=0, animate=False)
-            self._set_player_target(self._tw_results[0])
-        else:
-            self._set_player_target(None)
+            table.add_row(
+                result_cell(mark, downloaded),
+                result_cell(v.title[:72], downloaded),
+                result_cell(dur, downloaded),
+                result_cell(v.views_str, downloaded),
+                key=str(i),
+            )
+        self._place_result_cursor(table, self._tw_results, keep_id, active=self._active_tab() == "twitter")
 
     def _render_files_table(self) -> None:
         self._configure_files_table()
@@ -2012,7 +1413,9 @@ class FetchTUI(App):
     def _load_files(self) -> None:
         entries: list[FileEntry] = []
         if self._plex_dir.exists():
-            for path in sorted(self._plex_dir.rglob("*.mp4")):
+            for path in sorted(self._plex_dir.rglob("*")):
+                if path.suffix.lower() not in MEDIA_EXTENSIONS:
+                    continue
                 try:
                     stat = path.stat()
                 except OSError:
@@ -2029,14 +1432,7 @@ class FetchTUI(App):
         if entry is None:
             info.update("Select a file to preview it here.")
             return
-        info.update(
-            Text.from_markup(
-                f"[bold]{entry.name}[/]\n"
-                f"Size: {_fmt_size(entry.size)}\n"
-                f"Modified: {entry.modified_str}\n"
-                f"[dim]{entry.path}[/]"
-            )
-        )
+        info.update(_file_preview_text(entry))
 
     @on(Button.Pressed, "#btn-search")
     def _porn_btn(self) -> None:
@@ -2062,62 +1458,116 @@ class FetchTUI(App):
         query = self.query_one("#search-input", Input).value.strip()
         if not query:
             return
+        self._porn_search_cancel.set()
+        self._porn_search_cancel = threading.Event()
+        self._porn_search_generation += 1
+        generation = self._porn_search_generation
         filters = self.settings.search_filters
-        min_s = filters.min_duration_s
-        max_s = filters.max_duration_s
-        pages = filters.pages
-
         site = str(self.query_one("#site-select", Select).value)
+        self._porn_matches = []
+        self._porn_results = []
+        self._refresh_porn_display(keep_cursor=False, status_suffix="searching…")
 
         btn = self.query_one("#btn-search", Button)
         btn.disabled = True
         btn.label = "Searching…"
-        self.query_one("#result-count", Label).update("  searching…")
         self._log(f"Searching [{site}] for '{query}' with {self._filter_summary_text()}…")
-        self._porn_search_worker(query, site, min_s, max_s, pages)
+        self._porn_search_worker(
+            query, site, filters.min_duration_s, filters.max_duration_s, filters.pages,
+            generation, self._porn_search_cancel, filters,
+        )
 
-    @work(thread=True)
-    def _porn_search_worker(self, query: str, site: str, min_s: int, max_s: int, pages: int) -> None:
-        results: list[Video] = []
-        targets = list(SITE_FN.keys()) if site == "All Sites" else [site]
-        for s in targets:
-            found = SITE_FN[s](query, min_s, max_s, pages)
-            results.extend(found)
-            self.call_from_thread(self._log, f"  {s}: {len(found)} results")
-
-        results = [video for video in results if self._video_matches_search_filters(video)]
-        seen_ids: set[str] = set()
-        seen_titles: set[str] = set()
-        unique: list[Video] = []
-        for v in results:
-            norm = _normalize_title(v.title)
-            if v.id in seen_ids:
-                continue
-            if norm and norm in seen_titles:
-                continue
-            seen_ids.add(v.id)
-            if norm:
-                seen_titles.add(norm)
-            unique.append(v)
-        self.call_from_thread(self._porn_populate, unique, site, query)
-
-    def _porn_populate(self, results: list[Video], site: str, query: str) -> None:
+    @on(Button.Pressed, "#btn-clear")
+    def _porn_clear(self) -> None:
+        self._porn_search_cancel.set()
+        self._porn_search_cancel = threading.Event()
+        self._porn_search_generation += 1
+        self.query_one("#search-input", Input).value = ""
+        self._porn_matches = []
+        self._porn_results = []
+        self._refresh_porn_display(keep_cursor=False)
         btn = self.query_one("#btn-search", Button)
         btn.disabled = False
         btn.label = "Search"
 
-        if self.query_one("#hide-dl", Checkbox).value:
-            results = [
-                v for v in results
-                if v.id not in self._downloaded
-                and _normalize_title(v.title) not in self._downloaded_titles
-            ]
+    def _filters_for_bounds(self, min_s: int, max_s: int, pages: int) -> SearchFilters:
+        settings = getattr(self, "settings", None)
+        base = getattr(settings, "search_filters", None) or SearchFilters()
+        unlimited = 24 * 60 * 60
+        max_minutes = 0 if max_s >= unlimited else (max(0, int(max_s)) + 59) // 60
+        return SearchFilters(
+            min_duration_min=max(0, int(min_s)) // 60,
+            max_duration_min=max_minutes,
+            min_quality=base.min_quality,
+            min_rating=base.min_rating,
+            hd_only=base.hd_only,
+            pages=max(1, int(pages)),
+            exclude_phrases=base.exclude_phrases,
+            exclude_censored=base.exclude_censored,
+        )
 
-        self._porn_results = self._sort_results(results, self._porn_sort_key, self._porn_sort_reverse)
-        self._render_porn_results()
+    def _log_provider_diagnostics(self) -> None:
+        for diagnostics in (dict(LAST_PROVIDER_WARNINGS), dict(LAST_PROVIDER_ERRORS)):
+            for site_name, message in sorted(diagnostics.items()):
+                if message:
+                    self.call_from_thread(self._log, f"  {site_name}: {message}")
 
-        self.query_one("#result-count", Label).update(f"  {len(results)} results")
-        self._log(f"[{site}] '{query}' → {len(results)} videos")
+    @work(thread=True)
+    def _porn_search_worker(
+        self,
+        query: str,
+        site: str,
+        min_s: int,
+        max_s: int,
+        pages: int,
+        generation: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        filters: Optional[SearchFilters] = None,
+    ) -> None:
+        if generation is None:
+            generation = getattr(self, "_porn_search_generation", 0)
+        if filters is None:
+            filters = FetchTUI._filters_for_bounds(self, min_s, max_s, pages)
+        results: list[Video] = []
+        try:
+            def on_results(videos: list[Video], token: int = generation) -> None:
+                if token != getattr(self, "_porn_search_generation", token):
+                    return
+                self.call_from_thread(self._porn_show_partial, list(videos), token)
+
+            results = list(search_videos(
+                query,
+                site,
+                filters,
+                twitter_count=40,
+                settings=getattr(self, "settings", None),
+                on_results=on_results,
+                cancel_event=cancel_event,
+            ) or [])
+        except Exception as exc:
+            self.call_from_thread(self._log, f"Search error: {exc}")
+            results = []
+        if generation != getattr(self, "_porn_search_generation", generation):
+            return
+        FetchTUI._log_provider_diagnostics(self)
+        self.call_from_thread(self._porn_populate, results, site, query, generation)
+
+    def _porn_show_partial(self, results: list[Video], generation: int) -> None:
+        if generation != self._porn_search_generation:
+            return
+        self._porn_matches = self._sort_results(results, self._porn_sort_key, self._porn_sort_reverse)
+        self._refresh_porn_display(keep_cursor=True, status_suffix="searching…")
+
+    def _porn_populate(self, results: list[Video], site: str, query: str, generation: Optional[int] = None) -> None:
+        if generation is not None and generation != getattr(self, "_porn_search_generation", generation):
+            return
+        btn = self.query_one("#btn-search", Button)
+        btn.disabled = False
+        btn.label = "Search"
+
+        self._porn_matches = self._sort_results(results, self._porn_sort_key, self._porn_sort_reverse)
+        self._refresh_porn_display(keep_cursor=False)
+        self._log(f"[{site}] '{query}' → {len(self._porn_results)} videos")
 
     # ══════════════════════════════════════════════════════════════════════════
     # TWITTER TAB
@@ -2125,19 +1575,54 @@ class FetchTUI(App):
 
     @on(Button.Pressed, "#tw-btn-login")
     def _tw_login_btn(self) -> None:
-        self.push_screen(TwitterLoginScreen(), self._tw_login_callback)
+        if getattr(self, "_tw_signin_active", False):
+            cancel = getattr(self, "_tw_signin_cancel", None)
+            if cancel is not None:
+                cancel.set()
+                self._tw_signin_status("Twitter: cancelling sign-in…")
+                self._log("Twitter: cancelling sign-in…")
+            return
+        self._tw_signin_active = True
+        self._tw_signin_cancel = threading.Event()
+        try:
+            button = self.query_one("#tw-btn-login", Button)
+            button.label = "Cancel sign-in"
+            button.variant = "warning"
+            self.query_one("#tw-login-status", Static).update("Opening Chrome for X/Twitter sign-in…")
+        except Exception:
+            pass
+        self._tw_signin_worker(self._tw_signin_cancel)
 
-    def _tw_login_callback(self, result: Optional[str]) -> None:
-        if result:
-            self._log(f"Twitter: {result}")
-            self._tw_logged_in = TWITTER_COOKIES.exists()
-            btn = self.query_one("#tw-btn-login", Button)
-            if self._tw_logged_in:
-                btn.label = "✓ Logged in"
-                btn.variant = "success"
-            else:
-                btn.label = "Login"
-                btn.variant = "warning"
+    @work(thread=True)
+    def _tw_signin_worker(self, cancel: threading.Event) -> None:
+        try:
+            result = provider_login.sign_in(
+                "Twitter",
+                cancel=cancel,
+                on_status=lambda message: self.call_from_thread(self._tw_signin_status, message),
+            )
+        except Exception as exc:
+            result = provider_login.SignInResult(
+                "Twitter", False, 0, f"Twitter: sign-in failed ({exc.__class__.__name__}: {exc}).",
+            )
+        self.call_from_thread(self._tw_signin_finished, result)
+
+    def _tw_signin_status(self, message: str) -> None:
+        try:
+            self.query_one("#tw-login-status", Static).update(message)
+        except Exception:
+            pass
+
+    def _tw_signin_finished(self, result) -> None:
+        self._tw_signin_active = False
+        self._tw_signin_cancel = None
+        self._sync_twitter_login_button()
+        try:
+            self.query_one("#tw-login-status", Static).update(getattr(result, "message", ""))
+        except Exception:
+            pass
+        self._refresh_provider_signin_status()
+        self._log(getattr(result, "message", "Twitter: sign-in finished."))
 
     @on(Button.Pressed, "#tw-btn-search")
     def _tw_btn(self) -> None:
@@ -2149,8 +1634,8 @@ class FetchTUI(App):
 
     def _tw_do_search(self) -> None:
         if not self._tw_logged_in:
-            self._log("Twitter: login required first.")
-            self.push_screen(TwitterLoginScreen(), self._tw_login_callback)
+            self._log("Twitter: sign in first — opening the browser sign-in window.")
+            self._tw_login_btn()
             return
 
         query = self.query_one("#tw-search-input", Input).value.strip()
@@ -2162,47 +1647,71 @@ class FetchTUI(App):
         except ValueError:
             count = 40
 
+        self._tw_search_cancel.set()
+        self._tw_search_cancel = threading.Event()
+        self._tw_search_generation += 1
+        generation = self._tw_search_generation
+        self._tw_matches = []
+        self._tw_results = []
+        self._refresh_twitter_display(keep_cursor=False, status_suffix="searching…")
         btn = self.query_one("#tw-btn-search", Button)
         btn.disabled = True
         btn.label = "Searching…"
-        self.query_one("#tw-result-count", Label).update("  searching…")
         self._log(f"Twitter: searching '{query}'…")
-        self._tw_search_worker(query, count)
+        self._tw_search_worker(query, count, generation, self._tw_search_cancel)
+
+    @on(Button.Pressed, "#tw-btn-clear")
+    def _tw_clear(self) -> None:
+        self._tw_search_cancel.set()
+        self._tw_search_cancel = threading.Event()
+        self._tw_search_generation += 1
+        self.query_one("#tw-search-input", Input).value = ""
+        self._tw_matches = []
+        self._tw_results = []
+        self._refresh_twitter_display(keep_cursor=False)
+        btn = self.query_one("#tw-btn-search", Button)
+        btn.disabled = False
+        btn.label = "Search"
 
     @work(thread=True)
-    def _tw_search_worker(self, query: str, count: int) -> None:
+    def _tw_search_worker(
+        self,
+        query: str,
+        count: int,
+        generation: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
+        if generation is None:
+            generation = getattr(self, "_tw_search_generation", 0)
         try:
-            results = search_twitter(query, count, TWITTER_COOKIES)
+            optional = {}
+            if cancel_event is not None and _accepts_keyword(search_twitter, "cancel_event"):
+                optional["cancel_event"] = cancel_event
+            results = search_twitter(query, count, TWITTER_COOKIES, **optional)
         except Exception as e:
             self.call_from_thread(self._log, f"Twitter search error: {e}")
             results = []
 
-        # Dedup
+        if generation != getattr(self, "_tw_search_generation", generation):
+            return
         seen_ids: set[str] = set()
         unique: list[Video] = []
         for v in results:
             if v.id not in seen_ids:
                 seen_ids.add(v.id)
                 unique.append(v)
-        self.call_from_thread(self._tw_populate, unique, query)
+        self.call_from_thread(self._tw_populate, unique, query, generation)
 
-    def _tw_populate(self, results: list[Video], query: str) -> None:
+    def _tw_populate(self, results: list[Video], query: str, generation: Optional[int] = None) -> None:
+        if generation is not None and generation != getattr(self, "_tw_search_generation", generation):
+            return
         btn = self.query_one("#tw-btn-search", Button)
         btn.disabled = False
         btn.label = "Search"
 
-        if self.query_one("#tw-hide-dl", Checkbox).value:
-            results = [
-                v for v in results
-                if v.id not in self._downloaded
-                and _normalize_title(v.title) not in self._downloaded_titles
-            ]
-
-        self._tw_results = self._sort_results(results, self._tw_sort_key, self._tw_sort_reverse)
-        self._render_twitter_results()
-
-        self.query_one("#tw-result-count", Label).update(f"  {len(results)} results")
-        self._log(f"Twitter: '{query}' → {len(results)} video tweets")
+        self._tw_matches = self._sort_results(results, self._tw_sort_key, self._tw_sort_reverse)
+        self._refresh_twitter_display(keep_cursor=False)
+        self._log(f"Twitter: '{query}' → {len(self._tw_results)} video tweets")
 
     # ══════════════════════════════════════════════════════════════════════════
     # SELECTION (tab-aware)
@@ -2231,7 +1740,7 @@ class FetchTUI(App):
         try:
             self._toggle_index(int(event.row_key.value), results, table_id)  # type: ignore[arg-type]
         except (AttributeError, ValueError, TypeError):
-            pass
+            logger.debug("row selection could not be resolved to an index", exc_info=True)
 
     @on(DataTable.RowHighlighted)
     def _row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -2262,8 +1771,8 @@ class FetchTUI(App):
                 return
             self._porn_sort_reverse = not self._porn_sort_reverse if self._porn_sort_key == key else False
             self._porn_sort_key = key
-            self._porn_results = self._sort_results(self._porn_results, self._porn_sort_key, self._porn_sort_reverse)
-            self._render_porn_results()
+            self._porn_matches = self._sort_results(self._porn_matches, self._porn_sort_key, self._porn_sort_reverse)
+            self._refresh_porn_display()
         elif table_id == "#tw-results-table":
             mapping = {1: "title", 2: "duration", 3: "views"}
             key = mapping.get(event.column_index)
@@ -2271,8 +1780,8 @@ class FetchTUI(App):
                 return
             self._tw_sort_reverse = not self._tw_sort_reverse if self._tw_sort_key == key else False
             self._tw_sort_key = key
-            self._tw_results = self._sort_results(self._tw_results, self._tw_sort_key, self._tw_sort_reverse)
-            self._render_twitter_results()
+            self._tw_matches = self._sort_results(self._tw_matches, self._tw_sort_key, self._tw_sort_reverse)
+            self._refresh_twitter_display()
         elif table_id == "#files-table":
             mapping: dict[int, FileSortKey] = {0: "name", 1: "size", 2: "modified", 3: "path"}
             key = mapping.get(event.column_index)
@@ -2289,7 +1798,8 @@ class FetchTUI(App):
         v = results[idx]
         v.selected = not v.selected
         self.query_one(table_id, DataTable).update_cell_at(
-            Coordinate(idx, 0), "☑" if v.selected else "☐"
+            Coordinate(idx, 0),
+            result_cell("☑" if v.selected else "☐", self._downloaded_row(v)),
         )
 
     def action_select_all(self) -> None:
@@ -2299,7 +1809,7 @@ class FetchTUI(App):
         t = self.query_one(self._current_table_id(), DataTable)
         for i, v in enumerate(results):
             v.selected = True
-            t.update_cell_at(Coordinate(i, 0), "☑")
+            t.update_cell_at(Coordinate(i, 0), result_cell("☑", self._downloaded_row(v)))
 
     def action_clear_selection(self) -> None:
         if self._active_tab() == "files":
@@ -2308,7 +1818,7 @@ class FetchTUI(App):
         t = self.query_one(self._current_table_id(), DataTable)
         for i, v in enumerate(results):
             v.selected = False
-            t.update_cell_at(Coordinate(i, 0), "☐")
+            t.update_cell_at(Coordinate(i, 0), result_cell("☐", self._downloaded_row(v)))
 
     # ══════════════════════════════════════════════════════════════════════════
     # DOWNLOAD (tab-aware)
@@ -2397,11 +1907,8 @@ class FetchTUI(App):
     @on(Button.Pressed, "#btn-settings-reload")
     def _settings_reload_btn(self) -> None:
         self.settings = load_settings()
-        self._tmp_dir = self.settings.tmp_path
-        self._plex_dir = self.settings.plex_path
+        self._tmp_dir, self._plex_dir, warnings = resolve_runtime_dirs(self.settings)
         self._download_parallel = max(1, self.settings.parallel_downloads)
-        self._tmp_dir.mkdir(parents=True, exist_ok=True)
-        self._plex_dir.mkdir(parents=True, exist_ok=True)
         self.theme = self.settings.theme
         self._reload_downloaded_cache()
         self._populate_settings_controls()
@@ -2409,8 +1916,162 @@ class FetchTUI(App):
         self.query_one("#parallel", Input).value = str(self.settings.parallel_downloads)
         self._load_files()
         self._refresh_player_status()
-        self._set_settings_status("Settings reloaded.")
+        status = warnings[0] if warnings else "Settings reloaded."
+        self._set_settings_status(status)
         self._log("Settings reloaded from disk.")
+        for warning in warnings:
+            self._log(warning)
+
+    def _refresh_provider_signin_status(self) -> None:
+        for site in provider_login.SIGN_IN_SITES:
+            slug = site.lower()
+            try:
+                count = provider_login.cookie_count(site)
+            except Exception:
+                count = 0
+            legacy = False
+            if site == "Twitter" and count == 0:
+                try:
+                    legacy = bool(provider_login.twitter_authenticated())
+                except Exception:
+                    legacy = False
+            try:
+                label = self.query_one(f"#settings-signin-{slug}", Static)
+                if count:
+                    label.update(f"Signed in ({count} cookies)")
+                elif legacy:
+                    label.update("Signed in via legacy cookie file")
+                else:
+                    label.update("Not signed in")
+                signout = self.query_one(f"#btn-signout-{slug}", Button)
+                signout.disabled = count == 0 and not legacy
+            except Exception:
+                continue
+
+    def _sync_twitter_login_button(self) -> None:
+        """Match the Twitter tab's login button to the session stores."""
+        try:
+            self._tw_logged_in = bool(provider_login.twitter_authenticated())
+        except Exception:
+            self._tw_logged_in = False
+        try:
+            button = self.query_one("#tw-btn-login", Button)
+        except Exception:
+            return
+        button.disabled = False
+        if self._tw_logged_in:
+            button.label = "✓ Logged in"
+            button.variant = "success"
+        else:
+            button.label = "Login"
+            button.variant = "warning"
+
+    def _provider_signin_buttons(self) -> list[Button]:
+        buttons = []
+        for site in provider_login.SIGN_IN_SITES:
+            try:
+                buttons.append(self.query_one(f"#btn-signin-{site.lower()}", Button))
+            except Exception:
+                continue
+        return buttons
+
+    def _start_provider_signin(self, site: str) -> None:
+        active = getattr(self, "_signin_site", None)
+        if active:
+            if active == site:
+                self._signin_cancel.set()
+                self._set_settings_status(f"{site}: cancelling sign-in…")
+            else:
+                self._set_settings_status(f"{active}: a sign-in is already in progress.")
+            return
+        self._signin_site = site
+        self._signin_cancel = threading.Event()
+        try:
+            self.query_one(f"#btn-signin-{site.lower()}", Button).label = "Cancel sign-in"
+        except Exception:
+            pass
+        self._set_settings_status(f"{site}: opening Chrome for sign-in…")
+        self._provider_signin_worker(site, self._signin_cancel)
+
+    @work(thread=True)
+    def _provider_signin_worker(self, site: str, cancel: threading.Event) -> None:
+        try:
+            result = provider_login.sign_in(
+                site,
+                cancel=cancel,
+                on_status=lambda message: self.call_from_thread(self._set_settings_status, message),
+            )
+        except Exception as exc:
+            result = provider_login.SignInResult(
+                site, False, 0, f"{site}: sign-in failed ({exc.__class__.__name__}: {exc}).",
+            )
+        self.call_from_thread(self._provider_signin_finished, result)
+
+    def _provider_signin_finished(self, result) -> None:
+        self._signin_site = None
+        self._signin_cancel = None
+        for button in self._provider_signin_buttons():
+            button.label = "Sign in"
+        self._refresh_provider_signin_status()
+        if getattr(result, "site", None) == "Twitter":
+            self._sync_twitter_login_button()
+        self._set_settings_status(result.message)
+        self._log(result.message)
+
+    def _signout_provider(self, site: str) -> None:
+        try:
+            cleared = provider_login.clear_cookies(site)
+        except Exception as exc:
+            self._set_settings_status(f"{site}: sign-out failed ({exc}).")
+            return
+        self._refresh_provider_signin_status()
+        if site == "Twitter":
+            self._sync_twitter_login_button()
+        message = f"{site}: session cleared." if cleared else f"{site}: no stored session."
+        self._set_settings_status(message)
+        self._log(message)
+
+    @on(Button.Pressed, "Button.provider-signin")
+    def _provider_signin_button(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        for site in provider_login.SIGN_IN_SITES:
+            slug = site.lower()
+            if button_id == f"btn-signin-{slug}":
+                self._start_provider_signin(site)
+                event.stop()
+                return
+            if button_id == f"btn-signout-{slug}":
+                self._signout_provider(site)
+                event.stop()
+                return
+
+    @on(Button.Pressed, "Button.provider-test")
+    def _provider_test_button(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        for site in provider_login.SIGN_IN_SITES:
+            if button_id == f"btn-test-{site.lower()}":
+                self._set_settings_status(f"{site}: checking the stored session…")
+                self._provider_session_test_worker(site)
+                event.stop()
+                return
+
+    @work(thread=True)
+    def _provider_session_test_worker(self, site: str) -> None:
+        try:
+            check = provider_login.test_session(site)
+        except Exception as exc:
+            check = provider_login.SessionCheck(
+                site, "unknown", f"{site}: session check failed ({exc.__class__.__name__}: {exc}).",
+            )
+        self.call_from_thread(self._provider_session_test_finished, check)
+
+    def _provider_session_test_finished(self, check) -> None:
+        try:
+            self.query_one(f"#settings-signin-{check.site.lower()}", Static).update(check.message)
+        except Exception:
+            pass
+        self._set_settings_status(check.message)
+        self._log(check.message)
 
     @on(Button.Pressed, "#btn-settings-save")
     def _settings_save_btn(self) -> None:
@@ -2422,6 +2083,12 @@ class FetchTUI(App):
         except ValueError:
             self._set_settings_status("Parallel downloads must be a number.")
             return
+        try:
+            min_height = int(self.query_one("#settings-min-height", Input).value or "720")
+        except ValueError:
+            self._set_settings_status("Minimum download height must be a number.")
+            return
+        min_height = max(0, min(4320, min_height))
         if not plex_dir_raw or not tmp_dir_raw:
             self._set_settings_status("Download and temporary directories are required.")
             return
@@ -2430,23 +2097,29 @@ class FetchTUI(App):
             theme=theme,
             thumbnails_enabled=self.query_one("#settings-thumbnails", Checkbox).value,
             video_previews_enabled=self.query_one("#settings-video-previews", Checkbox).value,
-            plex_dir=str(Path(plex_dir_raw).expanduser()),
-            tmp_dir=str(Path(tmp_dir_raw).expanduser()),
+            plex_dir=plex_dir_raw,
+            tmp_dir=tmp_dir_raw,
             parallel_downloads=parallel,
+            min_download_height=min_height,
+            searxng_url=self.settings.searxng_url,
+            searxng_enabled=self.settings.searxng_enabled,
+            searxng_categories=self.settings.searxng_categories,
+            naming_template=self.settings.naming_template,
+            organize_by_site=self.settings.organize_by_site,
+            concurrent_fragments=self.settings.concurrent_fragments,
             search_filters=self.settings.search_filters,
         )
 
         try:
-            new_settings.tmp_path.mkdir(parents=True, exist_ok=True)
-            new_settings.plex_path.mkdir(parents=True, exist_ok=True)
+            new_settings, tmp_dir, plex_dir, warnings = prepare_runtime_settings(new_settings)
             save_settings(new_settings)
         except Exception as exc:
             self._set_settings_status(f"Failed to save settings: {exc}")
             return
 
         self.settings = new_settings
-        self._tmp_dir = self.settings.tmp_path
-        self._plex_dir = self.settings.plex_path
+        self._tmp_dir = tmp_dir
+        self._plex_dir = plex_dir
         self._download_parallel = max(1, self.settings.parallel_downloads)
         self.theme = self.settings.theme
         self._reload_downloaded_cache()
@@ -2454,11 +2127,13 @@ class FetchTUI(App):
         self.query_one("#parallel", Input).value = str(self.settings.parallel_downloads)
         self._load_files()
         self._refresh_player_status()
-        self._set_settings_status("Settings saved.")
+        self._set_settings_status(warnings[0] if warnings else "Settings saved.")
         self._log(
             f"Settings saved. theme={self.settings.theme} parallel={self.settings.parallel_downloads} "
             f"plex={self._plex_dir} tmp={self._tmp_dir}"
         )
+        for warning in warnings:
+            self._log(warning)
 
     def _dispatch_downloads(self) -> None:
         active = sum(
@@ -2498,6 +2173,7 @@ class FetchTUI(App):
                 norm = _normalize_title(finished.video.title)
                 if norm:
                     self._downloaded_titles.add(norm)
+                self.call_from_thread(self._refresh_download_marks, finished.video)
             row = self._all_job_rows.get(finished.video.id)
             if row:
                 self.call_from_thread(row.refresh_display)
@@ -2513,7 +2189,10 @@ class FetchTUI(App):
             else:
                 self.call_from_thread(self._schedule_remove_failed, finished)
 
-        run_download(job, self._tmp_dir, self._plex_dir, progress_cb, done_cb)
+        run_download(
+            job, self._tmp_dir, self._plex_dir, progress_cb, done_cb,
+            policy=self.settings.download_policy(),
+        )
 
     # ── Retry handler ─────────────────────────────────────────────────────────
     def on_job_row_retry_requested(self, event: JobRow.RetryRequested) -> None:
@@ -2619,7 +2298,7 @@ class FetchTUI(App):
     # ── Clean tmp ─────────────────────────────────────────────────────────────
     def action_clean_tmp(self) -> None:
         moved, deleted = cleanup_tmp(self._tmp_dir, self._plex_dir)
-        self._log(f"tmp/ cleanup: {moved} mp4 → plex, {deleted} partials deleted.")
+        self._log(f"tmp/ cleanup: {moved} media file(s) moved to plex, {deleted} partials deleted.")
 
     # ── Quit with guard ───────────────────────────────────────────────────────
     def action_quit_app(self) -> None:
@@ -2648,11 +2327,34 @@ def run_tui() -> int:
     return 0
 
 
+def _min_height_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ArgumentTypeError("must be an integer pixel height") from None
+    if not 0 <= parsed <= 4320:
+        raise ArgumentTypeError("must be between 0 and 4320")
+    return parsed
+
+
+def _download_policy(settings: AppSettings, min_height: Optional[int]) -> DownloadPolicy:
+    """Apply a per-command download floor on top of the configured policy."""
+    policy = settings.download_policy()
+    if min_height is None:
+        return policy
+    return DownloadPolicy(
+        min_height=min_height,
+        preview_ratio=policy.preview_ratio,
+        preview_min_seconds=policy.preview_min_seconds,
+    )
+
+
 def build_parser() -> ArgumentParser:
-    parser = ArgumentParser(prog="fetcher", description="Fetcher v1.0 CLI and TUI")
+    parser = ArgumentParser(prog="fetcher", description="Fetcher v1.0 GUI, CLI, and TUI")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("tui", help="Launch the Textual UI")
+    sub.add_parser("gui", help="Launch the native desktop GUI")
 
     search = sub.add_parser("search", help="Search and print matching videos")
     search.add_argument("query")
@@ -2660,7 +2362,7 @@ def build_parser() -> ArgumentParser:
     search.add_argument("--pages", type=int)
     search.add_argument("--min-duration", type=int, dest="min_duration")
     search.add_argument("--max-duration", type=int, dest="max_duration")
-    search.add_argument("--min-quality", choices=["any", "360", "480", "720", "1080"])
+    search.add_argument("--min-quality", choices=["720", "1080"])
     search.add_argument("--min-rating", type=int)
     search.add_argument("--hd-only", action="store_true")
     search.add_argument("--exclude")
@@ -2673,6 +2375,10 @@ def build_parser() -> ArgumentParser:
     download.add_argument("--site", choices=["PornHub", "xHamster", "RedTube", "Eporner", "Twitter"], default="PornHub")
     download.add_argument("--output-dir")
     download.add_argument("--tmp-dir")
+    download.add_argument(
+        "--min-height", type=_min_height_arg, metavar="PIXELS",
+        help="Download quality floor in pixels for this run (0 disables the floor)",
+    )
 
     batch = sub.add_parser("batch", help="Search and download the top matching results")
     batch.add_argument("query")
@@ -2680,7 +2386,7 @@ def build_parser() -> ArgumentParser:
     batch.add_argument("--pages", type=int)
     batch.add_argument("--min-duration", type=int, dest="min_duration")
     batch.add_argument("--max-duration", type=int, dest="max_duration")
-    batch.add_argument("--min-quality", choices=["any", "360", "480", "720", "1080"])
+    batch.add_argument("--min-quality", choices=["720", "1080"])
     batch.add_argument("--min-rating", type=int)
     batch.add_argument("--hd-only", action="store_true")
     batch.add_argument("--exclude")
@@ -2689,33 +2395,74 @@ def build_parser() -> ArgumentParser:
     batch.add_argument("--parallel", type=int, default=1)
     batch.add_argument("--output-dir")
     batch.add_argument("--tmp-dir")
+    batch.add_argument(
+        "--min-height", type=_min_height_arg, metavar="PIXELS",
+        help="Download quality floor in pixels for this run (0 disables the floor)",
+    )
     batch.add_argument("--json", action="store_true", help="Print selected results as JSON before downloading")
+
+    login = sub.add_parser("login", help="Sign in to a provider in a browser window")
+    login.add_argument("--site", choices=list(provider_login.SIGN_IN_SITES), required=True)
+    login.add_argument("--timeout", type=int, default=600, help="Seconds to wait for the browser sign-in")
+
+    logout = sub.add_parser("logout", help="Forget a stored provider session")
+    logout.add_argument("--site", choices=list(provider_login.SIGN_IN_SITES), required=True)
+
+    status = sub.add_parser("session-status", help="Check whether stored provider sessions are logged in")
+    status.add_argument(
+        "--site", choices=list(provider_login.SIGN_IN_SITES), action="append", dest="sites",
+        help="Provider to check (repeatable); defaults to every supported provider",
+    )
 
     return parser
 
 
-def cli_search(args: Namespace, settings: AppSettings) -> int:
+def _cli_search_results(args: Namespace, settings: AppSettings) -> list[Video]:
+    """Search once and expose provider diagnostics for both CLI workflows."""
+    LAST_PROVIDER_ERRORS.clear()
+    LAST_PROVIDER_WARNINGS.clear()
     filters = build_filters_from_args(args, settings)
-    results = search_videos(args.query, args.site, filters, twitter_count=args.count)
+    results = search_videos(args.query, args.site, filters, twitter_count=args.count, settings=settings)
     results.sort(key=lambda video: video.views, reverse=True)
+    for diagnostics in (LAST_PROVIDER_ERRORS, LAST_PROVIDER_WARNINGS):
+        for site, message in sorted(diagnostics.items()):
+            if args.site in ("All Sites", site):
+                print(f"Warning: {site}: {message}", file=sys.stderr)
+    return results
+
+
+def cli_search(args: Namespace, settings: AppSettings) -> int:
+    results = _cli_search_results(args, settings)
     if args.json:
         print(json.dumps([video_to_dict(video) for video in (results[:args.limit] if args.limit else results)], indent=2))
     else:
         print_results_table(results, limit=args.limit)
-    return 0
+    requested = list(SITE_FN) if args.site == "All Sites" else [args.site]
+    failed = [site for site in requested if site in LAST_PROVIDER_ERRORS]
+    if args.site == "All Sites":
+        return 1 if failed and len(failed) == len(requested) else 0
+    return 1 if failed else 0
 
 
 def cli_download(args: Namespace, settings: AppSettings) -> int:
-    output_dir = Path(args.output_dir).expanduser() if args.output_dir else settings.plex_path
-    tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else settings.tmp_path
-    output_dir.mkdir(parents=True, exist_ok=True)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    if args.output_dir or args.tmp_dir:
+        output_dir = Path(args.output_dir).expanduser() if args.output_dir else settings.plex_path
+        tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else settings.tmp_path
+        tmp_dir, output_dir, warnings = resolve_runtime_dirs(
+            AppSettings(plex_dir=str(output_dir), tmp_dir=str(tmp_dir))
+        )
+    else:
+        tmp_dir, output_dir, warnings = resolve_runtime_dirs(settings)
 
+    for warning in warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+    policy = _download_policy(settings, getattr(args, "min_height", None))
     exit_code = 0
     for target in args.targets:
         video = build_download_video(target, args.site)
         print(f"Downloading [{video.site}] {video.url}")
-        job = download_one(video, tmp_dir, output_dir)
+        job = download_one(video, tmp_dir, output_dir, policy)
         if job.status == "done":
             print(f"Saved to {job.filepath}")
         else:
@@ -2725,9 +2472,7 @@ def cli_download(args: Namespace, settings: AppSettings) -> int:
 
 
 def cli_batch(args: Namespace, settings: AppSettings) -> int:
-    filters = build_filters_from_args(args, settings)
-    results = search_videos(args.query, args.site, filters, twitter_count=args.count)
-    results.sort(key=lambda video: video.views, reverse=True)
+    results = _cli_search_results(args, settings)
     selected = results[: max(0, args.limit)]
     if not selected:
         print("No results selected for download.", file=sys.stderr)
@@ -2736,9 +2481,22 @@ def cli_batch(args: Namespace, settings: AppSettings) -> int:
     if args.json:
         print(json.dumps([video_to_dict(video) for video in selected], indent=2))
 
-    output_dir = Path(args.output_dir).expanduser() if args.output_dir else settings.plex_path
-    tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else settings.tmp_path
-    jobs = run_batch_download(selected, tmp_dir, output_dir, parallel=max(1, args.parallel))
+    if args.output_dir or args.tmp_dir:
+        output_dir = Path(args.output_dir).expanduser() if args.output_dir else settings.plex_path
+        tmp_dir = Path(args.tmp_dir).expanduser() if args.tmp_dir else settings.tmp_path
+        tmp_dir, output_dir, warnings = resolve_runtime_dirs(
+            AppSettings(plex_dir=str(output_dir), tmp_dir=str(tmp_dir))
+        )
+    else:
+        tmp_dir, output_dir, warnings = resolve_runtime_dirs(settings)
+
+    for warning in warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+    jobs = run_batch_download(
+        selected, tmp_dir, output_dir, parallel=max(1, args.parallel),
+        policy=_download_policy(settings, getattr(args, "min_height", None)),
+    )
 
     failures = [job for job in jobs if job.status != "done"]
     for job in jobs:
@@ -2747,9 +2505,82 @@ def cli_batch(args: Namespace, settings: AppSettings) -> int:
     return 1 if failures else 0
 
 
+def cli_login(args: Namespace, settings: AppSettings) -> int:
+    try:
+        result = provider_login.sign_in(
+            args.site,
+            timeout_s=max(5, int(args.timeout)),
+            on_status=lambda message: print(message, file=sys.stderr),
+        )
+    except Exception as exc:
+        print(f"{args.site}: sign-in failed ({exc.__class__.__name__}: {exc}).", file=sys.stderr)
+        return 1
+    print(result.message, file=sys.stdout if result.saved else sys.stderr)
+    return 0 if result.saved else 1
+
+
+def cli_logout(args: Namespace, settings: AppSettings) -> int:
+    try:
+        cleared = provider_login.clear_cookies(args.site)
+    except Exception as exc:
+        print(f"{args.site}: sign-out failed ({exc.__class__.__name__}: {exc}).", file=sys.stderr)
+        return 1
+    print(f"{args.site}: {'session cleared.' if cleared else 'no stored session.'}")
+    return 0
+
+
+def cli_session_status(args: Namespace, settings: AppSettings) -> int:
+    sites = list(getattr(args, "sites", None) or provider_login.SIGN_IN_SITES)
+    exit_code = 0
+    for site in sites:
+        try:
+            check = provider_login.test_session(site)
+        except Exception as exc:
+            check = provider_login.SessionCheck(
+                site, "unknown", f"{site}: session check failed ({exc.__class__.__name__}: {exc}).",
+            )
+        print(check.message)
+        if check.status != "valid":
+            exit_code = 1
+    return exit_code
+
+
+def _run_gui(argv: Optional[list[str]] = None) -> int:
+    _harden_state()
+    from fetcher_gui.app import run_gui
+
+    return run_gui(argv)
+
+
+def _launch_gui(gui_args: Optional[list[str]]) -> int:
+    try:
+        return _run_gui(gui_args)
+    except ModuleNotFoundError as exc:
+        if exc.name != "PySide6" and not (exc.name or "").startswith("PySide6."):
+            raise
+        print(
+            "Fetcher GUI requires PySide6. Install it with "
+            "`python -m pip install 'fetcher-v1[gui]'` or "
+            "`python -m pip install PySide6`.",
+            file=sys.stderr,
+        )
+        return 2
+
+
+def gui_main() -> int:
+    """Installed native-GUI entry point with dependency guidance."""
+    return main(["gui", *sys.argv[1:]])
+
+
 def main(argv: Optional[list[str]] = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if raw_args[:1] == ["gui"]:
+        return _launch_gui(raw_args[1:] or None)
+
+    _harden_state()
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_args)
     settings = load_settings()
 
     if args.command in (None, "tui"):
@@ -2760,6 +2591,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         return cli_download(args, settings)
     if args.command == "batch":
         return cli_batch(args, settings)
+    if args.command == "login":
+        return cli_login(args, settings)
+    if args.command == "logout":
+        return cli_logout(args, settings)
+    if args.command == "session-status":
+        return cli_session_status(args, settings)
 
     parser.print_help()
     return 1

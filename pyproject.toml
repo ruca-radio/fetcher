@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "fetcher-v1"
 version = "1.0.0"
-description = "Terminal UI and CLI for multi-site video search, preview, and download workflows."
+description = "Native GUI, terminal UI, and CLI for multi-site video search, preview, and download workflows."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
@@ -18,8 +18,21 @@ dependencies = [
   "rich",
   "selenium",
   "textual",
+  "yt-dlp[default,curl-cffi]",
 ]
 keywords = ["cli", "downloader", "terminal", "textual", "yt-dlp"]
+
+[project.optional-dependencies]
+gui = [
+  "PySide6>=6.8,<7",
+]
+fast = [
+  "aria2==0.0.1b0",
+]
+test = [
+  "pytest>=8",
+  "pytest-qt>=4.4",
+]
 
 [project.urls]
 Homepage = "https://github.com/ruca-radio/fetcher"
@@ -27,10 +40,15 @@ Repository = "https://github.com/ruca-radio/fetcher"
 
 [project.scripts]
 fetcher = "fetchtui:main"
+fetcher-gui = "fetchtui:gui_main"
 
 [tool.hatch.build.targets.wheel]
 include = [
+  "/fetcher_core",
+  "/fetcher_gui",
   "/fetchtui.py",
+  "/fetch",
+  "/fetch-gui",
   "/extract_twitter_cookies.py",
   "/capture_twitter_api.js",
   "/README.md",
