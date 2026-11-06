@@ -48,7 +48,7 @@ def test_tui_search_logs_catalog_warning_with_results(monkeypatch) -> None:
     monkeypatch.setattr(fetchtui, "LAST_PROVIDER_WARNINGS", warnings, raising=False)
     video = fetchtui.Video("hit", "Result", 120, 0, "https://example.test/hit", "PornHub")
 
-    def search(*args):
+    def search(*args, **kwargs):
         warnings["PornHub"] = "Restricted SFW catalog"
         return [video]
 
@@ -60,7 +60,7 @@ def test_tui_search_logs_catalog_warning_with_results(monkeypatch) -> None:
         _porn_populate=lambda rows, *_: populated.extend(rows),
         call_from_thread=lambda function, *args: function(*args),
     )
-    monkeypatch.setattr(fetchtui, "_search_provider", search)
+    monkeypatch.setattr(fetchtui, "search_videos", search)
 
     fetchtui.FetchTUI._porn_search_worker.__wrapped__(app, "needle", "PornHub", 0, 9999, 1)
 
@@ -388,6 +388,7 @@ def test_tui_settings_shows_provider_signin_status(monkeypatch) -> None:
         fetchtui.provider_login, "cookie_count",
         lambda site: 3 if site == "PornHub" else 0,
     )
+    monkeypatch.setattr(fetchtui.provider_login, "twitter_authenticated", lambda: False)
     app = _AppStub()
 
     fetchtui.FetchTUI._refresh_provider_signin_status(app)
@@ -440,6 +441,7 @@ def test_tui_provider_signin_finished_resets_controls(monkeypatch) -> None:
             return fetchtui.FetchTUI._provider_signin_buttons(self)
 
     monkeypatch.setattr(fetchtui.provider_login, "cookie_count", lambda site: 4 if site == "PornHub" else 0)
+    monkeypatch.setattr(fetchtui.provider_login, "twitter_authenticated", lambda: False)
     app = _AppStub()
     result = SimpleNamespace(message="PornHub: signed in; saved 4 session cookie(s).")
 
@@ -492,6 +494,7 @@ def test_tui_provider_signout_clears_session(monkeypatch) -> None:
             return fetchtui.FetchTUI._provider_signin_buttons(self)
 
     monkeypatch.setattr(fetchtui.provider_login, "cookie_count", lambda site: 0)
+    monkeypatch.setattr(fetchtui.provider_login, "twitter_authenticated", lambda: False)
     monkeypatch.setattr(fetchtui.provider_login, "clear_cookies", lambda site: True)
     app = _AppStub()
 
@@ -608,14 +611,26 @@ def test_tui_twitter_signin_finished_updates_login_button(monkeypatch) -> None:
             self.button = _ButtonStub()
             self.status = _StaticStub()
             self.logs = []
+            self.widgets = {"#tw-btn-login": self.button, "#tw-login-status": self.status}
+            for site in fetchtui.provider_login.SIGN_IN_SITES:
+                slug = site.lower()
+                self.widgets[f"#settings-signin-{slug}"] = _StaticStub()
+                self.widgets[f"#btn-signout-{slug}"] = _ButtonStub()
 
         def query_one(self, selector, *args, **kwargs):
-            return self.button if selector == "#tw-btn-login" else self.status
+            return self.widgets[selector]
 
         def _log(self, message):
             self.logs.append(message)
 
+        def _refresh_provider_signin_status(self):
+            return fetchtui.FetchTUI._refresh_provider_signin_status(self)
+
+        def _sync_twitter_login_button(self):
+            return fetchtui.FetchTUI._sync_twitter_login_button(self)
+
     monkeypatch.setattr(fetchtui.provider_login, "twitter_authenticated", lambda: True)
+    monkeypatch.setattr(fetchtui.provider_login, "cookie_count", lambda site: 5 if site == "Twitter" else 0)
     app = _AppStub()
     result = SimpleNamespace(saved=True, message="Twitter: signed in; saved 5 session cookie(s).")
 
@@ -628,3 +643,69 @@ def test_tui_twitter_signin_finished_updates_login_button(monkeypatch) -> None:
     assert app.button.disabled is False
     assert app.status.value == result.message
     assert app.logs == [result.message]
+
+
+def test_tui_settings_shows_legacy_twitter_session_and_signout_clears_the_tab(monkeypatch) -> None:
+    class _StaticStub:
+        def __init__(self):
+            self.value = ""
+
+        def update(self, value):
+            self.value = value
+
+    class _ButtonStub:
+        def __init__(self):
+            self.label = "Login"
+            self.variant = "warning"
+            self.disabled = None
+
+    class _AppStub:
+        def __init__(self):
+            self.widgets = {"#tw-btn-login": _ButtonStub()}
+            self._tw_logged_in = True
+            for site in fetchtui.provider_login.SIGN_IN_SITES:
+                slug = site.lower()
+                self.widgets[f"#settings-signin-{slug}"] = _StaticStub()
+                self.widgets[f"#btn-signout-{slug}"] = _ButtonStub()
+            self.statuses = []
+            self.logs = []
+
+        def query_one(self, selector, *args, **kwargs):
+            return self.widgets[selector]
+
+        def _set_settings_status(self, message):
+            self.statuses.append(message)
+
+        def _log(self, message):
+            self.logs.append(message)
+
+        def _refresh_provider_signin_status(self):
+            return fetchtui.FetchTUI._refresh_provider_signin_status(self)
+
+        def _sync_twitter_login_button(self):
+            return fetchtui.FetchTUI._sync_twitter_login_button(self)
+
+    state = {"authenticated": True}
+
+    monkeypatch.setattr(fetchtui.provider_login, "cookie_count", lambda site: 0)
+    monkeypatch.setattr(fetchtui.provider_login, "twitter_authenticated", lambda: state["authenticated"])
+
+    def clear(site):
+        assert site == "Twitter"
+        state["authenticated"] = False
+        return True
+
+    monkeypatch.setattr(fetchtui.provider_login, "clear_cookies", clear)
+    app = _AppStub()
+
+    fetchtui.FetchTUI._refresh_provider_signin_status(app)
+
+    assert app.widgets["#settings-signin-twitter"].value == "Signed in via legacy cookie file"
+    assert app.widgets["#btn-signout-twitter"].disabled is False
+
+    fetchtui.FetchTUI._signout_provider(app, "Twitter")
+
+    assert app._tw_logged_in is False
+    assert app.widgets["#tw-btn-login"].label == "Login"
+    assert app.widgets["#settings-signin-twitter"].value == "Not signed in"
+    assert app.statuses == ["Twitter: session cleared."]

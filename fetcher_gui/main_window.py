@@ -23,7 +23,7 @@ class MainWindow(QMainWindow):
     def __init__(self, *, search_service=None, preview_service=None, download_manager=None,
                  local_storage=None, plex_storage=None, settings_service=None, diagnostics=None,
                  player=None, thread_pool: QThreadPool | None = None, shutdown_grace_ms: int = 1_000,
-                 confirm=None,
+                 confirm=None, download_catalog=None,
                  parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Fetcher")
@@ -38,7 +38,7 @@ class MainWindow(QMainWindow):
         search_filters = getattr(persisted_settings, "search_filters", None)
         self.discover_page = DiscoverPage(
             search_service, preview_service, download_manager, search_filters=search_filters,
-            thread_pool=self.thread_pool, parent=self,
+            thread_pool=self.thread_pool, download_catalog=download_catalog, parent=self,
         )
         self.downloads_page = DownloadsPage(download_manager, self, task_pool=self.thread_pool)
         self.library_page = LibraryPage(

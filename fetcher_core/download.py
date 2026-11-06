@@ -25,6 +25,7 @@ from fetcher_core.age_gate import (
     is_pornhub_sfw_page,
     pornhub_age_gate_message,
 )
+from fetcher_core.download_log import record_download
 from fetcher_core.filters import is_known_censored_media_url
 from fetcher_core.jobs import DownloadManager, JobHistoryStore, terminate_process_group
 from fetcher_core.models import AppSettings, BASE_DIR, DownloadJob, DownloadPolicy, STATE_DIR, Video
@@ -190,6 +191,10 @@ def _twitter_cookie_args() -> list[str]:
 
 
 def _site_ytdlp_args(video: Video) -> list[str]:
+    # Twitter keeps a second, legacy token file. Route it through the helper
+    # that prefers a provider session only when that session has auth_token.
+    if video.site == "Twitter":
+        return _twitter_cookie_args()
     if video.site in provider_login.SIGN_IN_SITES:
         try:
             cookie_file = provider_login.netscape_cookie_file(video.site)
@@ -197,8 +202,6 @@ def _site_ytdlp_args(video: Video) -> list[str]:
             cookie_file = None
         if cookie_file is not None:
             return ["--cookies", str(cookie_file)]
-    if video.site == "Twitter":
-        return _twitter_cookie_args()
     return []
 
 
@@ -501,16 +504,25 @@ def _finalize_downloaded_file(job: DownloadJob, dest: Optional[Path], job_tmp_di
     target = final_dir / dest.name
     try:
         shutil.move(str(dest), str(target))
-        job.filepath = target; job.file_size = target.stat().st_size; job.status = "done"; job.progress = 100.0
-        quality_note = f" ({height}p)" if height else ""
-        job.eta = f"saved{quality_note}"
-        DOWNLOADED_IDS.parent.mkdir(parents=True, exist_ok=True)
-        with open(DOWNLOADED_IDS, "a") as f:
-            f.write(job.video.id + "\n")
-        return True
+        job.filepath = target
+        job.file_size = target.stat().st_size
     except Exception as exc:
         job.status = "failed"; job.eta = str(exc)
         return False
+    job.status = "done"
+    job.progress = 100.0
+    quality_note = f" ({height}p)" if height else ""
+    job.eta = f"saved{quality_note}"
+    try:
+        record_download(
+            job.video,
+            target,
+            log_path=DOWNLOADED_IDS.with_name("downloads.txt"),
+            legacy_path=DOWNLOADED_IDS,
+        )
+    except Exception:
+        logger.warning("failed to record download %s", job.video.id, exc_info=True)
+    return True
 
 
 def _build_ytdlp_download_cmd(ytdlp_cmd: list[str], job: DownloadJob, job_tmp_dir: Path, filename_template: str, format_selector: str, concurrent_fragments: int, *, force_generic: bool = False) -> list[str]:
@@ -657,18 +669,50 @@ def _is_pornhub_download(video: Video) -> bool:
     return video.site == "PornHub" or "pornhub" in urlparse(video.url or "").netloc.lower()
 
 
+def _legacy_twitter_cookie_pairs() -> list[tuple[str, str]]:
+    """Name/value pairs from the legacy Twitter token file, if it has auth_token."""
+    try:
+        payload = json.loads(TWITTER_COOKIES_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    pairs: list[tuple[str, str]] = []
+    for name, value in payload.items():
+        token = value.strip() if isinstance(value, str) else ""
+        if isinstance(name, str) and name and token:
+            pairs.append((name, token))
+    if not any(name == "auth_token" for name, _value in pairs):
+        return []
+    return pairs
+
+
+def _twitter_session_cookie_header() -> str:
+    """Cookie header for the Twitter session downloads should actually send."""
+    if provider_login.is_signed_in("Twitter") and provider_login.has_cookie("Twitter", "auth_token"):
+        try:
+            return provider_login.cookie_header("Twitter")
+        except Exception:
+            return ""
+    return "; ".join(f"{name}={value}" for name, value in _legacy_twitter_cookie_pairs())
+
+
 def _session_cookie_header(video: Video) -> str:
     """Combine PornHub's age-gate cookies with a stored provider session."""
     parts: list[str] = []
     if _is_pornhub_download(video):
         parts.append(PORNHUB_COOKIE_HEADER)
-    if video.site in provider_login.SIGN_IN_SITES:
+    if video.site == "Twitter":
+        stored = _twitter_session_cookie_header()
+    elif video.site in provider_login.SIGN_IN_SITES:
         try:
-            stored = provider_login.cookie_header(video.site)
+            stored = provider_login.session_cookie_header(video.site)
         except Exception:
             stored = ""
-        if stored:
-            parts.append(stored)
+    else:
+        stored = ""
+    if stored:
+        parts.append(stored)
     return "; ".join(parts)
 
 
@@ -787,15 +831,21 @@ def _resolve_browser_media_urls(video: Video, min_height: int = 0) -> tuple[list
         driver.set_script_timeout(12)
         pornhub = _is_pornhub_download(video)
         requested_url = _provider_download_url(video)
-        stored_cookies = (
-            provider_login.load_cookies(video.site)
-            if video.site in provider_login.SIGN_IN_SITES
-            else []
-        )
+        if video.site == "Twitter":
+            # Guest cookies are not a Twitter session. The authenticated helper
+            # below chooses the provider auth_token or the legacy token file.
+            stored_cookies = []
+        elif video.site in provider_login.SIGN_IN_SITES:
+            stored_cookies = provider_login.load_cookies(video.site)
+        else:
+            stored_cookies = []
         if pornhub:
             _prepare_pornhub_browser_session(driver)
             if stored_cookies:
                 provider_login.apply_to_selenium(driver, video.site)
+        elif video.site == "Twitter" and provider_login.twitter_authenticated():
+            driver.get(provider_login.SITE_HOME_URLS["Twitter"])
+            provider_login.apply_twitter_session_to_selenium(driver)
         elif stored_cookies:
             driver.get(provider_login.SITE_HOME_URLS[video.site])
             provider_login.apply_to_selenium(driver, video.site)

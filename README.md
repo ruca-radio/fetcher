@@ -190,13 +190,14 @@ The Textual interface includes:
 - Row selection and batch queueing
 - Configurable parallel downloads
 - Inline queue status and completed-download panels
+- A download log that greys out videos you already have. **Hide downloaded** omits them from the Porn and Twitter result lists; uncheck it to show those rows in grey
 - Playback controls for highlighted items
 - A local file browser for the configured output directory
 - Settings for theme, output path, temp path, thumbnails, previews, search defaults, and provider sign-in
 
 ## Native GUI
 
-The desktop interface provides Discover, Downloads, Library, and Settings workspaces. Search and file operations run outside the UI thread, downloads retain stop/retry state, and the player supports local playback, seeking, volume, mute, and full screen. Settings includes provider sign-in for PornHub, RedTube, xHamster, and Twitter/X.
+The desktop interface provides Discover, Downloads, Library, and Settings workspaces. Search and file operations run outside the UI thread, downloads retain stop/retry state, and the player supports local playback, seeking, volume, mute, and full screen. Settings includes provider sign-in for PornHub, RedTube, xHamster, and Twitter/X. Discover uses the same download log as the TUI: already-downloaded results are grey, and **Hide downloaded** removes them from the list.
 
 Local storage paths are used directly. An SFTP destination uses the portable form:
 
@@ -251,7 +252,8 @@ In a source checkout, Fetcher stores local runtime state in:
 This directory includes:
 
 - `settings.json`
-- `downloaded_ids.txt`
+- `downloads.txt` — one finished download per line (time, site, id, title, url, path). Search uses it to grey out or hide videos you already have. Files already in the download directory still count, including names like `Title [id].mkv`.
+- `downloaded_ids.txt` — legacy id list. New downloads still append here so older checkouts keep matching.
 - `twitter_cookies.json`
 - `cookies/` — owner-only provider sign-in sessions (PornHub, RedTube, xHamster, Twitter/X)
 

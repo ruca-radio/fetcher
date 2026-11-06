@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import shutil
 import sys
 import tempfile
@@ -10,8 +11,10 @@ from typing import Any
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from fetcher_core.download_log import DownloadCatalog
 from fetcher_core.jobs import JobHistoryStore
 from fetcher_core.models import AppSettings, PREVIEW_CACHE_DIR, SearchFilters, STATE_DIR
+from fetcher_core.providers import snapshot_diagnostics
 from fetcher_core.preview import PreviewCache
 from fetcher_core.settings import SettingsStore, is_sftp_storage, parse_sftp_storage, prepare_runtime_settings
 from fetcher_core.storage import LocalStorage, SftpStorage
@@ -20,12 +23,29 @@ from .main_window import DaemonTaskPool, MainWindow
 from .settings import apply_theme
 
 
+def _accepts_keyword(fn, name: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
+        return True
+    return name in parameters
+
+
 class SearchAdapter:
     def __init__(self, module, settings: AppSettings) -> None:
         self.module = module
         self.settings = settings
 
-    def search(self, query: str, provider: str, values: dict[str, object]):
+    def search(
+        self,
+        query: str,
+        provider: str,
+        values: dict[str, object],
+        on_progress=None,
+        cancel_event=None,
+    ):
         base = self.settings.search_filters
         filters = SearchFilters(
             min_duration_min=int(values.get("min_duration", base.min_duration_min) or 0),
@@ -37,19 +57,64 @@ class SearchAdapter:
             exclude_phrases=str(values.get("exclude", base.exclude_phrases) or ""),
             exclude_censored=bool(values.get("exclude_censored", base.exclude_censored)),
         )
-        errors = getattr(self.module, "LAST_PROVIDER_ERRORS", None)
-        warnings = getattr(self.module, "LAST_PROVIDER_WARNINGS", None)
-        for diagnostics in (errors, warnings):
+        module_errors = getattr(self.module, "LAST_PROVIDER_ERRORS", None)
+        module_warnings = getattr(self.module, "LAST_PROVIDER_WARNINGS", None)
+        for diagnostics in (module_errors, module_warnings):
             if isinstance(diagnostics, dict):
                 diagnostics.clear()
-        results = list(self.module.search_videos(query, provider, filters, twitter_count=40, settings=self.settings) or [])
-        warning_parts = []
+        owned: dict[str, dict[str, str]] = {"errors": {}, "warnings": {}}
+
+        def on_results(videos: list[object]) -> None:
+            if on_progress is None:
+                return
+            errors, warnings = snapshot_diagnostics(owned["errors"], owned["warnings"])
+            on_progress({
+                "results": list(videos),
+                "warning": self._warning_text(errors, warnings, videos),
+                "partial": True,
+            })
+
+        results, used_private = self._call_search_videos(
+            query, provider, filters, on_results if on_progress is not None else None, cancel_event, owned,
+        )
+        if used_private:
+            errors, warnings = owned["errors"], owned["warnings"]
+        else:
+            errors = module_errors if isinstance(module_errors, dict) else {}
+            warnings = module_warnings if isinstance(module_warnings, dict) else {}
+        return {
+            "results": results,
+            "warning": self._warning_text(errors, warnings, results, empty_message=True),
+            "partial": False,
+        }
+
+    def _call_search_videos(self, query, provider, filters, on_results, cancel_event, diagnostics):
+        function = self.module.search_videos
+        optional: dict[str, object] = {}
+        if on_results is not None and _accepts_keyword(function, "on_results"):
+            optional["on_results"] = on_results
+        if cancel_event is not None and _accepts_keyword(function, "cancel_event"):
+            optional["cancel_event"] = cancel_event
+        used_private = False
+        if _accepts_keyword(function, "diagnostics"):
+            optional["diagnostics"] = diagnostics
+            used_private = True
+        results = list(function(
+            query, provider, filters, twitter_count=40, settings=self.settings, **optional,
+        ) or [])
+        return results, used_private
+
+    @staticmethod
+    def _warning_text(errors, warnings, results, *, empty_message: bool = False) -> str:
+        parts: list[str] = []
         for diagnostics in (errors, warnings):
             if isinstance(diagnostics, dict):
-                warning_parts.extend(f"{site}: {message}" for site, message in sorted(diagnostics.items()) if message)
-        if not results:
-            warning_parts.append("No videos matched this search.")
-        return {"results": results, "warning": " ".join(warning_parts)}
+                parts.extend(
+                    f"{site}: {message}" for site, message in sorted(diagnostics.items()) if message
+                )
+        if empty_message and not results:
+            parts.append("No videos matched this search.")
+        return " ".join(parts)
 
 
 class PreviewAdapter:
@@ -210,6 +275,15 @@ def compose_services(*, state_dir: Path = STATE_DIR, fetchtui_module=None) -> di
         settings, tmp_dir, staging_dir,
         history_store=JobHistoryStore(state_dir / "jobs.json"),
     )
+    library_dirs: list[Path] = []
+    for candidate in (staging_dir, output_dir):
+        if candidate not in library_dirs:
+            library_dirs.append(candidate)
+    download_catalog = DownloadCatalog(
+        state_dir / "downloads.txt",
+        state_dir / "downloaded_ids.txt",
+        library_dirs,
+    )
     return {
         "search_service": SearchAdapter(module, settings),
         "preview_service": PreviewAdapter(module),
@@ -219,6 +293,7 @@ def compose_services(*, state_dir: Path = STATE_DIR, fetchtui_module=None) -> di
         "settings_service": ProductionSettingsService(store, settings),
         "diagnostics": lambda: _diagnostics(module),
         "thread_pool": DaemonTaskPool(),
+        "download_catalog": download_catalog,
         "startup_warnings": tuple(warnings),
         "startup_theme": str(preferences["theme"]),
     }

@@ -81,6 +81,21 @@ def test_search_results_model_scales_thumbnails_to_display_size() -> None:
     assert model.thumbnail_at(video.site, video.id).size() == QSize(320, 180)
 
 
+def test_search_results_model_greys_downloaded_rows() -> None:
+    model = SearchResultsModel()
+    video = sample_video()
+    model.set_results([video])
+    model.set_downloaded(lambda item: item.id == video.id)
+
+    color = model.data(model.index(0, 0), Qt.ItemDataRole.ForegroundRole)
+    assert color == QColor(138, 138, 138)
+    assert model.data(model.index(0, 1), Qt.ItemDataRole.ForegroundRole) == color
+    assert model.data(model.index(0, 0), Qt.ItemDataRole.ToolTipRole) == "Already downloaded"
+
+    model.set_downloaded(lambda _item: False)
+    assert model.data(model.index(0, 0), Qt.ItemDataRole.ForegroundRole) is None
+
+
 def test_search_results_model_prunes_thumbnails_removed_from_results() -> None:
     app = QApplication.instance() or QApplication([])
     model = SearchResultsModel()

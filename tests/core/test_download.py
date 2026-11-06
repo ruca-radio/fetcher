@@ -16,6 +16,8 @@ from fetcher_core.models import DownloadJob, DownloadPolicy, Video
 @pytest.fixture(autouse=True)
 def _isolated_provider_cookies(tmp_path, monkeypatch):
     monkeypatch.setattr(provider_login, "COOKIES_DIR", tmp_path / "isolated-provider-cookies")
+    monkeypatch.setattr(provider_login, "LEGACY_TWITTER_COOKIES", tmp_path / "isolated-legacy-twitter.json")
+    monkeypatch.setattr(provider_login, "LEGACY_TWITTER_NETSCAPE", tmp_path / "isolated-legacy-twitter.net.txt")
 
 
 def video(site: str = "Eporner", identifier: str = "abc123") -> Video:
@@ -118,6 +120,9 @@ def test_finalize_accepts_correct_length_eporner_file(monkeypatch, tmp_path: Pat
     assert job.status == "done"
     assert job.filepath == tmp_path / "out" / "clip.mkv"
     assert job.filepath.exists()
+    log_path = tmp_path / "state" / "downloads.txt"
+    assert "abc123" in log_path.read_text(encoding="utf-8")
+    assert (tmp_path / "state" / "downloaded_ids.txt").read_text(encoding="utf-8").strip() == "abc123"
 
 
 def test_browser_probe_cancel_does_not_start_flex_transfer(monkeypatch, tmp_path):
@@ -894,6 +899,43 @@ def test_browser_fallback_seeds_stored_provider_session(monkeypatch, tmp_path):
     assert state["cookies"][0]["name"] == "sessid"
 
 
+def test_browser_fallback_uses_legacy_twitter_token_not_anonymous_cookies(monkeypatch, tmp_path):
+    provider_login.save_cookies(
+        "Twitter",
+        [{"name": "guest_id", "value": "anon", "domain": ".x.com", "path": "/"}],
+    )
+    legacy = tmp_path / "twitter_cookies.json"
+    legacy.write_text(json.dumps({"auth_token": "LEGACYTOK"}), encoding="utf-8")
+    monkeypatch.setattr(provider_login, "LEGACY_TWITTER_COOKIES", legacy)
+    from selenium import webdriver
+
+    state = {"gets": [], "cookies": []}
+
+    class Browser:
+        page_source = "<html>tweet</html>"
+        current_url = "https://x.com/someone/status/1"
+
+        def set_page_load_timeout(self, seconds): pass
+        def set_script_timeout(self, seconds): pass
+        def get(self, url): state["gets"].append(url)
+        def add_cookie(self, cookie): state["cookies"].append(cookie)
+        def execute_async_script(self, script):
+            return [{"quality": "1080", "videoUrl": "https://cdn.test/full.mp4"}]
+        def quit(self): pass
+
+    monkeypatch.setattr(webdriver, "Chrome", lambda **kwargs: Browser())
+    item = Video("1", "clip", 30, 0, "https://x.com/someone/status/1", "Twitter")
+
+    urls, error = download._resolve_browser_media_urls(item, min_height=0)
+
+    assert error is None
+    assert urls == ["https://cdn.test/full.mp4"]
+    names = [cookie["name"] for cookie in state["cookies"]]
+    assert names == ["auth_token"]
+    assert state["cookies"][0]["value"] == "LEGACYTOK"
+    assert state["cookies"][0]["domain"] == ".x.com"
+
+
 def test_impersonation_args_follow_curl_cffi_availability(monkeypatch) -> None:
     monkeypatch.setattr(download, "_CURL_CFFI_AVAILABLE", True)
     assert download._impersonation_args() == ["--impersonate", "chrome"]
@@ -1116,3 +1158,26 @@ def test_twitter_cookie_args_ignores_provider_cookies_without_auth_token(monkeyp
 
     assert args[0] == "--cookies"
     assert "LEGACYTOK" in Path(args[1]).read_text(encoding="utf-8")
+
+
+def test_download_paths_ignore_anonymous_twitter_cookies_when_legacy_token_exists(monkeypatch, tmp_path):
+    """An anonymous browser capture must not hide a working legacy auth_token."""
+    provider_login.save_cookies(
+        "Twitter",
+        [{"name": "guest_id", "value": "anon", "domain": ".x.com", "path": "/"}],
+    )
+    legacy = tmp_path / "twitter_cookies.json"
+    legacy.write_text(json.dumps({"auth_token": "LEGACYTOK", "ct0": "csrf"}), encoding="utf-8")
+    monkeypatch.setattr(download, "TWITTER_COOKIES_JSON", legacy)
+    monkeypatch.setattr(download, "TWITTER_COOKIES_NETSCAPE", tmp_path / "legacy.net.txt")
+    item = video("Twitter", "tw1")
+
+    args = download._site_ytdlp_args(item)
+    header = download._session_cookie_header(item)
+
+    assert args[0] == "--cookies"
+    cookie_file = Path(args[1]).read_text(encoding="utf-8")
+    assert "LEGACYTOK" in cookie_file
+    assert "guest_id" not in cookie_file
+    assert "auth_token=LEGACYTOK" in header
+    assert "guest_id" not in header

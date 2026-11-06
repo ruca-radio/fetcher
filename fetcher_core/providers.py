@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import html
+import inspect
 import json
 import math
 import re
+import threading
 from argparse import Namespace
+from collections.abc import Callable
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
@@ -30,13 +34,105 @@ SITES = ["All Sites", "PornHub", "xHamster", "RedTube", "Eporner", "SearXNG"]
 TWITTER_COOKIES = STATE_DIR / "twitter_cookies.json"
 LAST_PROVIDER_ERRORS: dict[str, str] = {}
 LAST_PROVIDER_WARNINGS: dict[str, str] = {}
+_DIAGNOSTICS_LOCK = threading.Lock()
+_diagnostics_serial = 0
+# One search owns this pair of maps. Overlapping searches keep separate maps,
+# and provider threads inherit the map that was active when they were started.
+_search_diagnostics: contextvars.ContextVar[tuple[dict[str, str], dict[str, str]] | None] = contextvars.ContextVar(
+    "fetcher_search_diagnostics",
+    default=None,
+)
+
+
+def _diagnostic_maps() -> tuple[dict[str, str], dict[str, str]]:
+    sink = _search_diagnostics.get()
+    if sink is not None:
+        return sink
+    return LAST_PROVIDER_ERRORS, LAST_PROVIDER_WARNINGS
+
 
 def _record_provider_error(site: str, message: str) -> None:
-    LAST_PROVIDER_ERRORS[site] = message
+    with _DIAGNOSTICS_LOCK:
+        errors, _warnings = _diagnostic_maps()
+        errors[site] = message
 
 
 def _clear_provider_error(site: str) -> None:
-    LAST_PROVIDER_ERRORS.pop(site, None)
+    with _DIAGNOSTICS_LOCK:
+        errors, _warnings = _diagnostic_maps()
+        errors.pop(site, None)
+
+
+def _provider_error(site: str) -> Optional[str]:
+    with _DIAGNOSTICS_LOCK:
+        errors, _warnings = _diagnostic_maps()
+        return errors.get(site)
+
+
+def _clear_provider_warning(site: str) -> None:
+    with _DIAGNOSTICS_LOCK:
+        _errors, warnings = _diagnostic_maps()
+        warnings.pop(site, None)
+
+
+def snapshot_diagnostics(
+    errors: dict[str, str],
+    warnings: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Copy diagnostic maps while provider threads may still be writing them."""
+
+    with _DIAGNOSTICS_LOCK:
+        return dict(errors), dict(warnings)
+
+
+def _publish_global_diagnostics(errors: dict[str, str], warnings: dict[str, str], serial: int) -> None:
+    """Publish this search's diagnostics unless a newer search has started."""
+
+    global _diagnostics_serial
+    with _DIAGNOSTICS_LOCK:
+        if serial != _diagnostics_serial:
+            return
+        if errors is not LAST_PROVIDER_ERRORS:
+            LAST_PROVIDER_ERRORS.clear()
+            LAST_PROVIDER_ERRORS.update(errors)
+        if warnings is not LAST_PROVIDER_WARNINGS:
+            LAST_PROVIDER_WARNINGS.clear()
+            LAST_PROVIDER_WARNINGS.update(warnings)
+
+
+def _cancelled(cancel_event: Optional[threading.Event]) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _pause(seconds: float, cancel_event: Optional[threading.Event]) -> bool:
+    """Wait up to ``seconds``. Return True when the search was cancelled."""
+
+    if _cancelled(cancel_event):
+        return True
+    if cancel_event is None:
+        import time
+        time.sleep(seconds)
+        return False
+    return cancel_event.wait(seconds)
+
+
+def _accepts_keyword(fn: Callable[..., object], name: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
+        return True
+    return name in parameters
+
+
+def _call_with_optional(fn: Callable[..., object], args: tuple[object, ...], optional: dict[str, object]) -> object:
+    kwargs = {
+        key: value
+        for key, value in optional.items()
+        if value is not None and _accepts_keyword(fn, key)
+    }
+    return fn(*args, **kwargs)
 
 
 def _format_provider_exception(exc: Exception) -> str:
@@ -44,12 +140,24 @@ def _format_provider_exception(exc: Exception) -> str:
     return f"{exc.__class__.__name__}: {message}"
 
 
-def _search_provider(site: str, query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
-    try:
-        return SITE_FN[site](query, min_s, max_s, pages)
-    except Exception as exc:
-        _record_provider_error(site, _format_provider_exception(exc))
-        return []
+def _search_provider(
+    site: str,
+    query: str,
+    min_s: int,
+    max_s: int,
+    pages: int,
+    *,
+    on_page: Optional[Callable[[list[Video]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[Video]:
+    # Let the caller record the failure. Swallowing it here would replace
+    # rows already streamed through on_page with an empty list.
+    found = _call_with_optional(
+        SITE_FN[site],
+        (query, min_s, max_s, pages),
+        {"on_page": on_page, "cancel_event": cancel_event},
+    )
+    return list(found or [])
 
 def _parse_dur(s: str) -> int:
     parts = str(s).split(":")
@@ -291,11 +399,23 @@ class _PornHubSearchParser(HTMLParser):
             node.text = (node.text or "") + data
 
 
-def _search_pornhub_html(client, query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
+def _search_pornhub_html(
+    client,
+    query: str,
+    min_s: int,
+    max_s: int,
+    pages: int,
+    *,
+    on_page: Optional[Callable[[list[Video]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[Video]:
     out: list[Video] = []
     seen: set[str] = set()
     gated = False
     for page in range(1, pages + 1):
+        if _cancelled(cancel_event):
+            break
+        page_rows: list[Video] = []
         url = f"https://www.pornhub.com/video/search?search={quote_plus(query)}&page={page}"
         try:
             response = _pornhub_get(client, url)
@@ -343,7 +463,7 @@ def _search_pornhub_html(client, query: str, min_s: int, max_s: int, pages: int)
             _record_provider_error("PornHub", "search results list missing; the page may be gated or its layout has changed")
             continue
         _clear_provider_error("PornHub")
-        LAST_PROVIDER_WARNINGS.pop("PornHub", None)
+        _clear_provider_warning("PornHub")
         for card in parser.results.findall("li"):
             if not (
                 card.get("data-video-vkey") or card.get("data-video-id")
@@ -374,7 +494,7 @@ def _search_pornhub_html(client, query: str, min_s: int, max_s: int, pages: int)
                 continue
             views = next((node for node in card.iter() if "views" in node.get("class", "").split()), None)
             thumbnail = next(card.iter("img"), None)
-            out.append(Video(
+            video = Video(
                 id=vid,
                 title=title,
                 duration_s=dur,
@@ -385,27 +505,44 @@ def _search_pornhub_html(client, query: str, min_s: int, max_s: int, pages: int)
                     thumbnail.get("data-mediumthumb"), thumbnail.get("data-thumb_url"),
                     thumbnail.get("data-src"), thumbnail.get("src"),
                 ) if thumbnail is not None else None,
-            ))
+            )
+            out.append(video)
+            page_rows.append(video)
+        if page_rows and on_page is not None:
+            on_page(page_rows)
     if out and not gated:
         _clear_provider_error("PornHub")
     return out
 
 
-def search_pornhub(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
+def search_pornhub(
+    query: str,
+    min_s: int,
+    max_s: int,
+    pages: int,
+    *,
+    on_page: Optional[Callable[[list[Video]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[Video]:
     out, seen = [], set()
     _clear_provider_error("PornHub")
-    LAST_PROVIDER_WARNINGS.pop("PornHub", None)
+    _clear_provider_warning("PornHub")
     with build_client(timeout=20) as c:
         _apply_pornhub_age_cookies(c)
         _apply_site_session(c, "PornHub")
-        html_results = _search_pornhub_html(c, query, min_s, max_s, pages)
-        if html_results or "PornHub" not in LAST_PROVIDER_ERRORS:
+        html_results = _search_pornhub_html(
+            c, query, min_s, max_s, pages, on_page=on_page, cancel_event=cancel_event,
+        )
+        if html_results or _provider_error("PornHub") is None:
             return html_results
-        if LAST_PROVIDER_ERRORS.get("PornHub") == pornhub_age_gate_message():
+        if _provider_error("PornHub") == pornhub_age_gate_message():
             # 18+ interstitial or server-side SFW restriction: the legacy
             # webmasters API sits behind the same gate, so do not retry it.
             return html_results
         for page in range(1, pages + 1):
+            if _cancelled(cancel_event):
+                break
+            page_rows: list[Video] = []
             url = f"https://www.pornhub.com/webmasters/search?search={quote_plus(query)}&page={page}"
             try:
                 response = _pornhub_get(c, url)
@@ -419,13 +556,12 @@ def search_pornhub(query: str, min_s: int, max_s: int, pages: int) -> list[Video
                     or parse_qs(final_url.query).get("search") != [query]
                     or "json" not in content_type
                 ):
-                    _record_provider_error("PornHub", "legacy webmaster API unavailable; trying HTML search fallback")
-                    return _search_pornhub_html(c, query, min_s, max_s, pages)
+                    # HTML was already searched. Repeating it only delays the failure.
+                    return out or html_results
                 try:
                     payload = response.json()
                 except ValueError:
-                    _record_provider_error("PornHub", "legacy webmaster API returned non-JSON; trying HTML search fallback")
-                    return _search_pornhub_html(c, query, min_s, max_s, pages)
+                    return out or html_results
                 for v in payload.get("videos", []):
                     vid = v.get("video_id", "")
                     if not vid or vid in seen:
@@ -434,15 +570,19 @@ def search_pornhub(query: str, min_s: int, max_s: int, pages: int) -> list[Video
                     dur = _parse_dur(v.get("duration", ""))
                     if min_s <= dur <= max_s:
                         hd = bool(v.get("hd"))
-                        out.append(Video(id=vid, title=v.get("title", ""),
+                        video = Video(id=vid, title=v.get("title", ""),
                             duration_s=dur, views=int(v.get("views", 0) or 0),
                             url=f"https://www.pornhub.com/view_video.php?viewkey={vid}",
                             site="PornHub",
                             thumbnail_url=_first_clean_thumbnail(v.get("default_thumb"), v.get("thumb")),
                             rating_percent=_parse_percent(v.get("rating")),
                             quality_p=_parse_quality(v.get("quality")) or (720 if hd else 480),
-                            is_hd=hd))
+                            is_hd=hd)
+                        out.append(video)
+                        page_rows.append(video)
                 _clear_provider_error("PornHub")
+                if page_rows and on_page is not None:
+                    on_page(page_rows)
             except Exception as exc:
                 _record_provider_error("PornHub", str(exc))
     return out
@@ -467,13 +607,24 @@ def _xh_parse(html: str) -> list[dict]:
     return []
 
 
-def search_xhamster(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
+def search_xhamster(
+    query: str,
+    min_s: int,
+    max_s: int,
+    pages: int,
+    *,
+    on_page: Optional[Callable[[list[Video]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[Video]:
     out, seen = [], set()
     skipped_blurred = 0
     slug = re.sub(r"\s+", "-", query.strip())
     with build_client(timeout=20, follow_redirects=True) as c:
         _apply_site_session(c, "xHamster")
         for page in range(1, pages + 1):
+            if _cancelled(cancel_event):
+                break
+            page_rows: list[Video] = []
             url = f"https://xhamster.com/search/{slug}" + (f"?page={page}" if page > 1 else "")
             try:
                 for v in _xh_parse(c.get(url).text):
@@ -496,28 +647,43 @@ def search_xhamster(query: str, min_s: int, max_s: int, pages: int) -> list[Vide
                     if min_s <= dur <= max_s:
                         quality = _parse_quality(v.get("quality")) or _parse_quality(v.get("videoQuality"))
                         hd_flag = v.get("isHD")
-                        out.append(Video(id=vid, title=v.get("title", ""),
+                        video = Video(id=vid, title=v.get("title", ""),
                             duration_s=dur, views=int(v.get("viewCount", 0) or 0),
                             url=page_url,
                             site="xHamster",
                             thumbnail_url=thumbnail,
                             rating_percent=_parse_percent(v.get("rating")),
                             quality_p=quality,
-                            is_hd=bool(hd_flag) if hd_flag is not None else (quality >= 720 if quality is not None else None)))
-                if out:
+                            is_hd=bool(hd_flag) if hd_flag is not None else (quality >= 720 if quality is not None else None))
+                        out.append(video)
+                        page_rows.append(video)
+                if page_rows:
                     _clear_provider_error("xHamster")
+                if page_rows and on_page is not None:
+                    on_page(page_rows)
             except Exception as exc:
-                _record_provider_error("xHamster", str(exc))
+                _record_provider_error("xHamster", _format_provider_exception(exc))
     if not out and skipped_blurred:
         _record_provider_error("xHamster", f"skipped {skipped_blurred} blurred/search-only rows that are not downloadable")
     return out
 
 
-def search_redtube(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
+def search_redtube(
+    query: str,
+    min_s: int,
+    max_s: int,
+    pages: int,
+    *,
+    on_page: Optional[Callable[[list[Video]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[Video]:
     out, seen = [], set()
     with build_client(timeout=20) as c:
         _apply_site_session(c, "RedTube")
         for page in range(1, pages + 1):
+            if _cancelled(cancel_event):
+                break
+            page_rows: list[Video] = []
             url = (f"https://api.redtube.com/?data=redtube.Videos.searchVideos"
                    f"&search={quote_plus(query)}&output=json&page={page}&limit=20"
                    f"&thumbsize=big")
@@ -533,24 +699,40 @@ def search_redtube(query: str, min_s: int, max_s: int, pages: int) -> list[Video
                         # The RedTube API may omit quality metadata entirely.
                         # Unknown quality must remain eligible for later probing.
                         hd = bool(v["hd"]) if "hd" in v else None
-                        out.append(Video(id=vid, title=v.get("title", ""),
+                        video = Video(id=vid, title=v.get("title", ""),
                             duration_s=dur, views=int(v.get("views", 0) or 0),
                             url=v.get("url", f"https://www.redtube.com/{vid}"),
                             site="RedTube",
                             thumbnail_url=_first_clean_thumbnail(v.get("default_thumb"), v.get("thumb")),
                             rating_percent=_parse_percent(v.get("rating")),
                             quality_p=_parse_quality(v.get("quality")) or (720 if hd else 480 if hd is False else None),
-                            is_hd=hd))
-                _clear_provider_error("RedTube")
+                            is_hd=hd)
+                        out.append(video)
+                        page_rows.append(video)
+                if page_rows:
+                    _clear_provider_error("RedTube")
+                if page_rows and on_page is not None:
+                    on_page(page_rows)
             except Exception as exc:
-                _record_provider_error("RedTube", str(exc))
+                _record_provider_error("RedTube", _format_provider_exception(exc))
     return out
 
 
-def search_eporner(query: str, min_s: int, max_s: int, pages: int) -> list[Video]:
+def search_eporner(
+    query: str,
+    min_s: int,
+    max_s: int,
+    pages: int,
+    *,
+    on_page: Optional[Callable[[list[Video]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[Video]:
     out, seen = [], set()
     with build_client(timeout=20) as c:
         for page in range(1, pages + 1):
+            if _cancelled(cancel_event):
+                break
+            page_rows: list[Video] = []
             url = (f"https://www.eporner.com/api/v2/video/search/"
                    f"?query={quote_plus(query)}&per_page=20&page={page}"
                    f"&min_duration={min_s}&max_duration={max_s}&format=json")
@@ -569,20 +751,25 @@ def search_eporner(query: str, min_s: int, max_s: int, pages: int) -> list[Video
                             raw_url = "https://www.eporner.com" + raw_url
                         if min_s <= dur <= max_s:
                             quality = _parse_quality(v.get("quality"))
-                            out.append(Video(id=vid, title=v.get("title", ""),
+                            video = Video(id=vid, title=v.get("title", ""),
                                 duration_s=dur, views=int(v.get("views", 0) or 0),
                                 url=raw_url, site="Eporner",
                                 thumbnail_url=_first_clean_thumbnail(v.get("default_thumb"), v.get("thumb")),
                                 rating_percent=_parse_percent(v.get("rate") or v.get("rating")),
                                 quality_p=quality,
                                 is_hd=(quality >= 720) if quality is not None else None,
-                                keywords=v.get("keywords", "")))
+                                keywords=v.get("keywords", ""))
+                            out.append(video)
+                            page_rows.append(video)
                     except Exception:
                         # A single malformed row must not abort the rest of the page.
                         continue
-                _clear_provider_error("Eporner")
+                if page_rows:
+                    _clear_provider_error("Eporner")
+                if page_rows and on_page is not None:
+                    on_page(page_rows)
             except Exception as exc:
-                _record_provider_error("Eporner", str(exc))
+                _record_provider_error("Eporner", _format_provider_exception(exc))
     return out
 
 
@@ -628,7 +815,15 @@ def _resolved_searxng_url(raw_url: str, base_url: str) -> Optional[str]:
     return _unwrap_nudevista_url(raw_url)
 
 
-def search_searxng(query: str, settings: AppSettings, pages: int, limit: int = 0) -> list[Video]:
+def search_searxng(
+    query: str,
+    settings: AppSettings,
+    pages: int,
+    limit: int = 0,
+    *,
+    on_page: Optional[Callable[[list[Video]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[Video]:
     base_url = settings.searxng_url.strip().rstrip("/")
     if not base_url:
         return []
@@ -643,7 +838,10 @@ def search_searxng(query: str, settings: AppSettings, pages: int, limit: int = 0
         params["categories"] = settings.searxng_categories.strip()
     with build_client(timeout=25, follow_redirects=True) as client:
         for page in range(1, max(1, pages) + 1):
+            if _cancelled(cancel_event):
+                break
             params["pageno"] = str(page)
+            page_rows: list[Video] = []
             try:
                 response = client.get(f"{base_url}/search", params=params)
                 response.raise_for_status()
@@ -672,7 +870,7 @@ def search_searxng(query: str, settings: AppSettings, pages: int, limit: int = 0
                 if site == "SearXNG" and author:
                     site = author[:1].upper() + author[1:]
                 digest = hashlib.sha1(source_url.encode("utf-8")).hexdigest()[:16]
-                out.append(Video(
+                video = Video(
                     id=f"searxng-{digest}",
                     title=title,
                     duration_s=_parse_dur(str(item.get("length") or "")),
@@ -680,10 +878,16 @@ def search_searxng(query: str, settings: AppSettings, pages: int, limit: int = 0
                     url=source_url,
                     site=site or "SearXNG",
                     thumbnail_url=thumb,
-                ))
+                )
+                out.append(video)
+                page_rows.append(video)
                 if limit > 0 and len(out) >= limit:
                     _clear_provider_error("SearXNG")
+                    if page_rows and on_page is not None:
+                        on_page(page_rows)
                     return out
+            if page_rows and on_page is not None:
+                on_page(page_rows)
     if out:
         _clear_provider_error("SearXNG")
     return out
@@ -696,28 +900,203 @@ SITE_FN = {
     "Eporner":  search_eporner,
 }
 
-def _searxng_results(query: str, filters: SearchFilters, settings: Optional[AppSettings]) -> list[Video]:
-    if settings is None or not settings.searxng_enabled:
-        _record_provider_error("SearXNG", "SearXNG is disabled; enable it in settings to search the wider web")
-        return []
-    found = search_searxng(query, settings, filters.pages)
-    return [video for video in found if video_matches_filters(video, filters)]
+_SEARXNG_DISABLED = "SearXNG is disabled; enable it in settings to search the wider web"
 
 
-def search_videos(query: str, site: str, filters: SearchFilters, twitter_count: int = 40, settings: Optional[AppSettings] = None) -> list[Video]:
-    if site == "Twitter":
-        return dedupe_videos(search_twitter(query, twitter_count, TWITTER_COOKIES))
+def _search_job_names(site: str, settings: Optional[AppSettings]) -> list[str]:
     if site == "SearXNG":
-        return dedupe_videos(_searxng_results(query, filters, settings))
+        return ["SearXNG"]
+    if site != "All Sites":
+        return [site]
+    names = list(SITE_FN)
+    if settings is not None and settings.searxng_enabled:
+        names.append("SearXNG")
+    return names
 
-    sites = list(SITE_FN) if site == "All Sites" else [site]
-    results: list[Video] = []
-    for name in sites:
-        found = _search_provider(name, query, filters.min_duration_s, filters.max_duration_s, filters.pages)
-        results.extend(video for video in found if video_matches_filters(video, filters))
-    if site == "All Sites" and settings is not None and settings.searxng_enabled:
-        results.extend(_searxng_results(query, filters, settings))
-    return dedupe_videos(results)
+
+def _emit_search_snapshot(
+    order: list[str],
+    buckets: dict[str, list[Video]],
+    state: dict[str, object],
+    data_lock: threading.Lock,
+    publish_lock: threading.Lock,
+    on_results: Optional[Callable[[list[Video]], None]],
+) -> None:
+    """Publish one canonical snapshot without holding the data lock."""
+
+    if on_results is None:
+        return
+    with data_lock:
+        merged: list[Video] = []
+        for name in order:
+            merged.extend(buckets[name])
+        current = dedupe_videos(merged)
+        ids = [(video.site, video.id) for video in current]
+        if ids == state["ids"]:
+            return
+        state["seq"] = int(state["seq"]) + 1
+        seq = state["seq"]
+        state["ids"] = ids
+        payload = list(current)
+    with publish_lock:
+        with data_lock:
+            if seq != state["seq"]:
+                return
+            published = list(payload)
+        try:
+            on_results(published)
+        except Exception:
+            # A slow UI callback must not discard results already collected.
+            return
+
+
+def _collect_search_results(
+    query: str,
+    site: str,
+    filters: SearchFilters,
+    twitter_count: int,
+    settings: Optional[AppSettings],
+    on_results: Optional[Callable[[list[Video]], None]],
+    cancel_event: Optional[threading.Event],
+) -> list[Video]:
+    if site == "Twitter":
+        found = _call_with_optional(
+            search_twitter,
+            (query, twitter_count, TWITTER_COOKIES),
+            {"cancel_event": cancel_event},
+        )
+        results = dedupe_videos(list(found or []))
+        if on_results is not None:
+            on_results(list(results))
+        return results
+
+    order = _search_job_names(site, settings)
+    direct_names = [name for name in order if name != "SearXNG"]
+    direct_sites = set(direct_names)
+    buckets: dict[str, list[Video]] = {name: [] for name in order}
+    data_lock = threading.Lock()
+    publish_lock = threading.Lock()
+    state: dict[str, object] = {"seq": 0, "ids": None}
+
+    def accept(name: str, videos: list[Video], *, replace: bool) -> None:
+        filtered = [video for video in videos if video_matches_filters(video, filters)]
+        with data_lock:
+            if replace:
+                buckets[name] = filtered
+            else:
+                buckets[name].extend(filtered)
+        _emit_search_snapshot(order, buckets, state, data_lock, publish_lock, on_results)
+
+    def without_on_site_hits(videos: list[Video]) -> list[Video]:
+        # All Sites already searched these providers on their own sites.
+        if not direct_sites:
+            return videos
+        return [video for video in videos if _site_from_url(video.url) not in direct_sites]
+
+    def run_site(name: str) -> None:
+        try:
+            if _cancelled(cancel_event):
+                return
+            if name == "SearXNG":
+                if settings is None or not settings.searxng_enabled:
+                    _record_provider_error("SearXNG", _SEARXNG_DISABLED)
+                    found: list[Video] = []
+                else:
+                    def on_searx_page(rows: list[Video], site_name: str = name) -> None:
+                        accept(site_name, without_on_site_hits(rows), replace=False)
+
+                    found = without_on_site_hits(list(_call_with_optional(
+                        search_searxng,
+                        (query, settings, filters.pages),
+                        {"on_page": on_searx_page, "cancel_event": cancel_event},
+                    ) or []))
+            else:
+                def on_provider_page(rows: list[Video], site_name: str = name) -> None:
+                    accept(site_name, rows, replace=False)
+
+                found = _search_provider(
+                    name,
+                    query,
+                    filters.min_duration_s,
+                    filters.max_duration_s,
+                    filters.pages,
+                    on_page=on_provider_page,
+                    cancel_event=cancel_event,
+                )
+            accept(name, list(found or []), replace=True)
+        except Exception as exc:
+            # Keep pages already published. The final replace only runs after
+            # a provider returns its full list.
+            _record_provider_error(name, _format_provider_exception(exc))
+
+    threads: list[threading.Thread] = []
+    try:
+        for name in direct_names:
+            if _cancelled(cancel_event):
+                break
+            # Python 3.14 does not copy contextvars into a thread unless asked.
+            # Provider errors have to land in this search's diagnostic maps.
+            thread = threading.Thread(
+                target=run_site,
+                args=(name,),
+                daemon=True,
+                name=f"fetcher-search-{name}",
+                context=contextvars.copy_context(),
+            )
+            thread.start()
+            threads.append(thread)
+    finally:
+        for thread in threads:
+            thread.join()
+    # Wider-web results come after every on-site provider has finished.
+    if "SearXNG" in order and not _cancelled(cancel_event):
+        run_site("SearXNG")
+    with data_lock:
+        merged: list[Video] = []
+        for name in order:
+            merged.extend(buckets[name])
+        return dedupe_videos(merged)
+
+
+def search_videos(
+    query: str,
+    site: str,
+    filters: SearchFilters,
+    twitter_count: int = 40,
+    settings: Optional[AppSettings] = None,
+    *,
+    on_results: Optional[Callable[[list[Video]], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    diagnostics: Optional[dict[str, dict[str, str]]] = None,
+) -> list[Video]:
+    """Search one site, or every site at once, and return rows in site order.
+
+    PornHub, xHamster, RedTube, and Eporner use that site's own search and run
+    together. SearXNG starts only after those finish, and its hits for those
+    sites are left out so a provider row always comes from the provider.
+    ``on_results`` receives each new snapshot in that same order. A newer
+    overlapping search keeps its own diagnostics.
+    """
+
+    global _diagnostics_serial
+    if isinstance(diagnostics, dict):
+        errors = diagnostics.setdefault("errors", {})
+        warnings = diagnostics.setdefault("warnings", {})
+        if not isinstance(errors, dict) or not isinstance(warnings, dict):
+            errors, warnings = {}, {}
+    else:
+        errors, warnings = {}, {}
+    with _DIAGNOSTICS_LOCK:
+        _diagnostics_serial += 1
+        serial = _diagnostics_serial
+    token = _search_diagnostics.set((errors, warnings))
+    try:
+        return _collect_search_results(
+            query, site, filters, twitter_count, settings, on_results, cancel_event,
+        )
+    finally:
+        _search_diagnostics.reset(token)
+        _publish_global_diagnostics(errors, warnings, serial)
 
 
 def video_to_dict(video: Video) -> dict[str, object]:
@@ -780,13 +1159,20 @@ def build_download_video(target: str, site: str) -> Video:
 
 
 # ── Twitter/X search via headless Chrome + network capture ───────────────────
-def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
+def search_twitter(
+    query: str,
+    count: int,
+    cookies_file: Path,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[Video]:
     """Search Twitter Media tab using headless Chrome, capture GraphQL responses."""
-    import time as _time
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
 
     _clear_provider_error("Twitter")
+    if _cancelled(cancel_event):
+        return []
 
     # Prefer the Settings browser sign-in session; the legacy auth_token file
     # remains supported for users who imported it manually.
@@ -833,30 +1219,32 @@ def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
     try:
         driver = webdriver.Chrome(options=opts)
         driver.get("https://x.com")
-        _time.sleep(2)
-        if stored_cookies:
-            provider_login.apply_to_selenium(driver, "Twitter")
-        if not stored_auth_token:
-            driver.add_cookie({
-                "name": "auth_token", "value": auth_token,
-                "domain": ".x.com", "path": "/",
-            })
-            ct0 = str(legacy.get("ct0") or "")
-            if ct0:
-                driver.add_cookie({"name": "ct0", "value": ct0, "domain": ".x.com", "path": "/"})
+        if not _pause(2, cancel_event):
+            if stored_cookies:
+                provider_login.apply_to_selenium(driver, "Twitter")
+            if not stored_auth_token:
+                driver.add_cookie({
+                    "name": "auth_token", "value": auth_token,
+                    "domain": ".x.com", "path": "/",
+                })
+                ct0 = str(legacy.get("ct0") or "")
+                if ct0:
+                    driver.add_cookie({"name": "ct0", "value": ct0, "domain": ".x.com", "path": "/"})
 
-        # Search media tab
-        from urllib.parse import quote_plus as _qp
-        driver.get(f"https://x.com/search?q={_qp(query)}&f=media")
-        _time.sleep(6)
+            # Search media tab
+            from urllib.parse import quote_plus as _qp
+            driver.get(f"https://x.com/search?q={_qp(query)}&f=media")
+            if not _pause(6, cancel_event):
+                # Scroll to load more results
+                scrolls = max(1, count // 40)
+                for _ in range(scrolls):
+                    if _cancelled(cancel_event):
+                        break
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+                    if _pause(3, cancel_event):
+                        break
 
-        # Scroll to load more results
-        scrolls = max(1, count // 40)
-        for _ in range(scrolls):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-            _time.sleep(3)
-
-        # Parse network logs for SearchTimeline responses
+        # Parse network logs for SearchTimeline responses, including a cancelled run.
         logs = driver.get_log("performance")
         for entry in logs:
             msg = json.loads(entry["message"])["message"]
@@ -958,7 +1346,7 @@ def search_twitter(query: str, count: int, cookies_file: Path) -> list[Video]:
 
     if out:
         _clear_provider_error("Twitter")
-    elif "Twitter" not in LAST_PROVIDER_ERRORS:
+    elif not _cancelled(cancel_event) and _provider_error("Twitter") is None:
         _record_provider_error("Twitter", "no media results captured; Chrome may be missing or the query returned nothing")
 
     return out

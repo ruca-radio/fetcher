@@ -10,6 +10,7 @@ from PySide6.QtCore import QEvent, QSize, QThreadPool, Qt
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import QApplication, QHeaderView, QWidget
 
+from fetcher_core.download_log import DownloadCatalog
 from fetcher_core.jobs import JobSnapshot
 from fetcher_core.models import AppSettings, SearchFilters, Video
 from fetcher_core.storage import StorageEntry, TargetExistsError
@@ -279,6 +280,45 @@ def test_discover_exposes_quality_duration_and_rating_filters(qtbot) -> None:
     }
 
 
+def test_discover_hides_downloaded_results_until_the_checkbox_is_cleared(qtbot, tmp_path: Path) -> None:
+    catalog = DownloadCatalog(tmp_path / "downloads.txt", tmp_path / "downloaded_ids.txt")
+    catalog.record(Video("kept", "Kept", 1, 1, "https://kept", "Eporner"))
+    page = DiscoverPage(
+        StubSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool(), download_catalog=catalog,
+    )
+    qtbot.addWidget(page)
+    fresh = Video("new", "New", 1, 1, "https://new", "Eporner")
+    kept = Video("kept", "Kept", 1, 1, "https://kept", "Eporner")
+
+    page.accept_search_result(page.search_generation, [fresh, kept])
+
+    assert page.hide_downloaded_checkbox.isChecked()
+    assert page.results_model.rowCount() == 1
+    assert page.results_model.video_at(0).id == "new"
+    assert page.error_label.text() == "1 downloaded hidden."
+
+    page.hide_downloaded_checkbox.setChecked(False)
+
+    assert page.results_model.rowCount() == 2
+    kept_row = next(row for row in range(2) if page.results_model.video_at(row).id == "kept")
+    assert page.results_model.data(page.results_model.index(kept_row, 0), Qt.ItemDataRole.ForegroundRole) == QColor(138, 138, 138)
+    assert page.results_model.data(page.results_model.index(1 - kept_row, 0), Qt.ItemDataRole.ForegroundRole) is None
+
+    page.hide_downloaded_checkbox.setChecked(True)
+    page.accept_search_result(page.search_generation, [kept])
+    assert page.results_model.rowCount() == 0
+    assert "already downloaded" in page.error_label.text().lower()
+
+    page.hide_downloaded_checkbox.setChecked(False)
+    catalog.record(fresh)
+    page.accept_search_result(page.search_generation, [fresh, kept])
+    page._on_download_snapshot(SimpleNamespace(status="done"))
+    assert page.results_model.rowCount() == 2
+    for row in range(2):
+        color = page.results_model.data(page.results_model.index(row, 0), Qt.ItemDataRole.ForegroundRole)
+        assert color == QColor(138, 138, 138)
+
+
 def test_discover_table_fits_160x90_thumbnails(qtbot) -> None:
     page = DiscoverPage(StubSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
     qtbot.addWidget(page)
@@ -485,6 +525,116 @@ def test_discover_search_shows_searching_status_then_results(qtbot) -> None:
     release.set()
     qtbot.waitUntil(lambda: page.results_model.rowCount() == 1, timeout=2_000)
     assert page.results_model.video_at(0).id == "blonde"
+
+
+def test_discover_new_search_clears_previous_rows_while_the_next_search_runs(qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowSearch:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def search(self, query: str, provider: str, filters: dict[str, object]):
+            self.calls += 1
+            if self.calls == 1:
+                return [Video("old", "Old", 60, 1, "https://example/old", provider)]
+            started.set()
+            release.wait(timeout=2)
+            return [Video("new", "New", 60, 1, "https://example/new", provider)]
+
+    page = DiscoverPage(SlowSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    page.query_edit.setText("old")
+    page.search()
+    qtbot.waitUntil(lambda: page.results_model.rowCount() == 1, timeout=2_000)
+    assert page.results_model.video_at(0).id == "old"
+
+    page.query_edit.setText("new")
+    page.search()
+    qtbot.waitUntil(started.is_set, timeout=2_000)
+
+    assert page.results_model.rowCount() == 0
+    assert "searching" in page.error_label.text().lower()
+    release.set()
+    qtbot.waitUntil(
+        lambda: page.results_model.rowCount() == 1 and page.results_model.video_at(0).id == "new",
+        timeout=2_000,
+    )
+
+
+def test_discover_clear_drops_query_and_ignores_a_late_result(qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class SlowSearch:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def search(self, query: str, provider: str, filters: dict[str, object]):
+            self.calls += 1
+            if self.calls == 1:
+                return [Video("old", "Old", 60, 1, "https://example/old", provider)]
+            started.set()
+            release.wait(timeout=2)
+            finished.set()
+            return [Video("late", "Late", 60, 1, "https://example/late", provider)]
+
+    page = DiscoverPage(SlowSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    page.query_edit.setText("old")
+    page.search()
+    qtbot.waitUntil(lambda: page.results_model.rowCount() == 1, timeout=2_000)
+
+    page.clear_button.click()
+    assert page.query_edit.text() == ""
+    assert page.results_model.rowCount() == 0
+    assert page.search_button.isEnabled()
+
+    page.query_edit.setText("late")
+    page.search()
+    qtbot.waitUntil(started.is_set, timeout=2_000)
+    assert page.results_model.rowCount() == 0
+    page.clear_button.click()
+    assert page.query_edit.text() == ""
+    assert page.results_model.rowCount() == 0
+
+    release.set()
+    qtbot.waitUntil(finished.is_set, timeout=2_000)
+    qtbot.wait(100)
+    assert page.results_model.rowCount() == 0
+    assert page.query_edit.text() == ""
+    assert page.search_button.isEnabled()
+
+
+def test_discover_shows_a_partial_result_before_search_finishes(qtbot) -> None:
+    release = threading.Event()
+
+    class ProgressiveSearch:
+        def search(self, query, provider, filters, on_progress=None, cancel_event=None):
+            fast = Video("fast", "Fast", 60, 1, "https://example/fast", provider)
+            if on_progress is not None:
+                on_progress({"results": [fast], "warning": "", "partial": True})
+            release.wait(timeout=2)
+            slow = Video("slow", "Slow", 60, 1, "https://example/slow", provider)
+            return {"results": [fast, slow], "warning": "", "partial": False}
+
+    page = DiscoverPage(ProgressiveSearch(), StubPreview(), StubJobs(), thread_pool=QThreadPool())
+    qtbot.addWidget(page)
+    page.query_edit.setText("blonde")
+    page.search()
+    qtbot.waitUntil(
+        lambda: page.results_model.rowCount() == 1 and page.results_model.video_at(0).id == "fast",
+        timeout=2_000,
+    )
+
+    assert not release.is_set()
+    assert "searching" in page.error_label.text().lower()
+    release.set()
+    qtbot.waitUntil(lambda: page.results_model.rowCount() == 2, timeout=2_000)
+    assert [page.results_model.video_at(row).id for row in range(2)] == ["fast", "slow"]
+    assert "searching" not in page.error_label.text().lower()
 
 
 def test_discover_empty_search_results_are_visible(qtbot) -> None:

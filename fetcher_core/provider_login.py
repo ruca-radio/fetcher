@@ -31,9 +31,10 @@ from .models import STATE_DIR
 
 COOKIES_DIR = STATE_DIR / "cookies"
 LEGACY_TWITTER_COOKIES = STATE_DIR / "twitter_cookies.json"
+LEGACY_TWITTER_NETSCAPE = STATE_DIR / "twitter_cookies.net.txt"
 
-# Providers where a browser sign-in unlocks additional content.  Eporner has
-# no account wall, and Twitter keeps its existing token/cookie import flow.
+# Providers where a browser sign-in unlocks additional content. Eporner has
+# no account wall. Twitter accepts this browser flow and the legacy token file.
 SIGN_IN_SITES: tuple[str, ...] = ("PornHub", "RedTube", "xHamster", "Twitter")
 
 SITE_LOGIN_URLS: dict[str, str] = {
@@ -205,16 +206,52 @@ def is_signed_in(site: str) -> bool:
     return cookie_count(site) > 0
 
 
-def legacy_twitter_auth_token() -> str:
-    """Read the legacy ``twitter_cookies.json`` auth_token, if present."""
+def legacy_twitter_cookies() -> dict[str, str]:
+    """Read string cookies from the legacy ``twitter_cookies.json`` file."""
     try:
         payload = json.loads(LEGACY_TWITTER_COOKIES.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        return ""
+        return {}
     if not isinstance(payload, dict):
-        return ""
-    token = payload.get("auth_token")
-    return token.strip() if isinstance(token, str) else ""
+        return {}
+    cookies: dict[str, str] = {}
+    for name, value in payload.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+        token = value.strip()
+        if name and token:
+            cookies[name] = token
+    return cookies
+
+
+def legacy_twitter_auth_token() -> str:
+    """Read the legacy ``twitter_cookies.json`` auth_token, if present."""
+    return legacy_twitter_cookies().get("auth_token", "")
+
+
+def twitter_auth_cookies() -> list[dict[str, object]]:
+    """Twitter cookies that include an auth_token.
+
+    A provider capture is used only when it contains ``auth_token``. Otherwise
+    the legacy token file is used. Guest cookies from an unfinished browser
+    sign-in are omitted so they cannot hide a working legacy session.
+    """
+    if has_cookie("Twitter", "auth_token"):
+        return load_cookies("Twitter")
+    legacy = legacy_twitter_cookies()
+    if not legacy.get("auth_token"):
+        return []
+    return [
+        {
+            "name": name,
+            "value": value,
+            "domain": ".x.com",
+            "path": "/",
+            "secure": True,
+            "expiry": None,
+        }
+        for name, value in legacy.items()
+    ]
 
 
 def has_cookie(site: str, name: str) -> bool:
@@ -231,7 +268,10 @@ def clear_cookies(site: str) -> bool:
     """Forget a provider session; returns whether any state existed."""
     site = _normalize_site(site)
     removed = False
-    for path in (cookie_path(site), _netscape_path(site)):
+    paths = [cookie_path(site), _netscape_path(site)]
+    if site == "Twitter":
+        paths.extend((LEGACY_TWITTER_COOKIES, LEGACY_TWITTER_NETSCAPE))
+    for path in paths:
         try:
             path.unlink()
             removed = True
@@ -251,6 +291,26 @@ def cookie_header(site: str) -> str:
     headers: dict[str, str] = {}
     for cookie in load_cookies(site):
         headers[str(cookie["name"])] = str(cookie["value"])
+    return "; ".join(f"{name}={value}" for name, value in headers.items())
+
+
+def session_cookie_header(site: str) -> str:
+    """Cookie header for the session search and downloads should send.
+
+    Twitter sends provider cookies only when they contain ``auth_token``.
+    Otherwise it sends the legacy token file. An anonymous capture is omitted.
+    """
+    try:
+        normalized = _normalize_site(site)
+    except ValueError:
+        return ""
+    cookies = twitter_auth_cookies() if normalized == "Twitter" else load_cookies(normalized)
+    headers: dict[str, str] = {}
+    for cookie in cookies:
+        name = str(cookie.get("name") or "")
+        value = cookie.get("value")
+        if name and isinstance(value, str) and value:
+            headers[name] = value
     return "; ".join(f"{name}={value}" for name, value in headers.items())
 
 
@@ -312,6 +372,32 @@ def apply_to_selenium(driver, site: str) -> int:
             "name": str(cookie["name"]),
             "value": str(cookie["value"]),
             "domain": str(cookie["domain"]),
+            "path": str(cookie.get("path") or "/"),
+            "secure": bool(cookie.get("secure")),
+        }
+        if cookie.get("expiry"):
+            payload["expiry"] = int(cookie["expiry"])
+        try:
+            driver.add_cookie(payload)
+            applied += 1
+        except Exception:
+            continue
+    return applied
+
+
+def apply_twitter_session_to_selenium(driver) -> int:
+    """Attach the authenticated Twitter session to a browser already on x.com.
+
+    Cookie domains are rewritten to ``.x.com``. Selenium rejects a cookie whose
+    domain is not the current page, so a token stored for twitter.com would
+    otherwise be dropped on an x.com tab.
+    """
+    applied = 0
+    for cookie in twitter_auth_cookies():
+        payload: dict[str, object] = {
+            "name": str(cookie["name"]),
+            "value": str(cookie["value"]),
+            "domain": ".x.com",
             "path": str(cookie.get("path") or "/"),
             "secure": bool(cookie.get("secure")),
         }
@@ -497,21 +583,25 @@ def _probe_aylo_session(site: str, client) -> SessionCheck:
             f"{site}: the site served its restricted catalog, so the session could not be "
             "verified from this network.",
         )
-    if (
+    explicit_in = bool(
         re.search(r"\bisLoggedInUser\s*=\s*1\b", text)
         or re.search(r'"isLoggedIn"\s*:\s*true', text)
-        or "profileMenuDropdown" in text
-        or "ph-icon-logout" in text
-    ):
-        return SessionCheck(site, "valid", f"{site}: the stored session is logged in.")
-    if (
+    )
+    explicit_out = bool(
         re.search(r"\bisLoggedInUser\s*=\s*0\b", text)
         or re.search(r'"isLoggedIn"\s*:\s*false', text)
-    ):
+    )
+    # Shared header markup includes logout icons on logged-out pages. An
+    # explicit flag wins over those class names.
+    if explicit_in:
+        return SessionCheck(site, "valid", f"{site}: the stored session is logged in.")
+    if explicit_out:
         return SessionCheck(
             site, "invalid",
             f"{site}: the stored session is not logged in; sign in again.",
         )
+    if "profileMenuDropdown" in text or "ph-icon-logout" in text:
+        return SessionCheck(site, "valid", f"{site}: the stored session is logged in.")
     return SessionCheck(
         site, "unknown",
         f"{site}: the page did not report a login state; the session could not be verified.",
@@ -531,13 +621,20 @@ def test_session(site: str, *, timeout: float = 15.0) -> SessionCheck:
         return SessionCheck(site, "missing", f"{site}: no stored session; sign in first.")
     try:
         with build_client(timeout=timeout, follow_redirects=True) as client:
+            if site == "Twitter":
+                auth_cookies = twitter_auth_cookies()
+                jar = getattr(client, "cookies", None)
+                if jar is not None:
+                    for cookie in auth_cookies:
+                        name = str(cookie.get("name") or "")
+                        value = cookie.get("value")
+                        if not name or not isinstance(value, str) or not value:
+                            continue
+                        jar.set(name, value, domain=".x.com", path=str(cookie.get("path") or "/"))
+                has_token = any(str(cookie.get("name")) == "auth_token" for cookie in auth_cookies)
+                return _probe_twitter_session(client, has_auth_token=has_token)
             if is_signed_in(site):
                 apply_to_httpx(client, site)
-            elif legacy_token:
-                client.cookies.set("auth_token", legacy_token, domain=".x.com", path="/")
-            if site == "Twitter":
-                has_token = has_cookie("Twitter", "auth_token") or bool(legacy_token)
-                return _probe_twitter_session(client, has_auth_token=has_token)
             if site == "xHamster":
                 return _probe_xhamster_session(client)
             return _probe_aylo_session(site, client)

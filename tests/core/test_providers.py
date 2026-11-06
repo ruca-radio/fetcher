@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from argparse import Namespace
 from unittest.mock import patch
 
@@ -15,6 +17,8 @@ from fetcher_core.providers import build_filters_from_args
 @pytest.fixture(autouse=True)
 def _isolated_provider_cookies(tmp_path, monkeypatch):
     monkeypatch.setattr(provider_login, "COOKIES_DIR", tmp_path / "isolated-provider-cookies")
+    monkeypatch.setattr(provider_login, "LEGACY_TWITTER_COOKIES", tmp_path / "isolated-legacy-twitter.json")
+    monkeypatch.setattr(provider_login, "LEGACY_TWITTER_NETSCAPE", tmp_path / "isolated-legacy-twitter.net.txt")
 
 
 class _ClientContext:
@@ -742,6 +746,23 @@ def test_search_videos_searxng_uses_provider_when_enabled(monkeypatch):
     assert [row.id for row in rows] == ["sx1"]
 
 
+def test_explicit_searxng_search_keeps_links_from_known_providers(monkeypatch):
+    monkeypatch.setattr(
+        providers,
+        "search_searxng",
+        lambda *args, **kwargs: [Video(
+            "copied", "Copied", 30, 1,
+            "https://www.pornhub.com/view_video.php?viewkey=copied", "PornHub",
+        )],
+    )
+
+    rows = providers.search_videos(
+        "q", "SearXNG", SearchFilters(min_quality="any"), settings=AppSettings(searxng_enabled=True),
+    )
+
+    assert [row.id for row in rows] == ["copied"]
+
+
 def test_search_videos_all_sites_includes_searxng_when_enabled(monkeypatch):
     monkeypatch.setattr(providers, "SITE_FN", {})
     monkeypatch.setattr(providers, "search_searxng", lambda query, settings, pages, limit=0: [_hd_video()])
@@ -757,6 +778,71 @@ def test_search_videos_all_sites_skips_searxng_when_disabled(monkeypatch):
     monkeypatch.setattr(providers, "search_searxng", _fail)
     settings = AppSettings(searxng_enabled=False)
     assert providers.search_videos("q", "All Sites", SearchFilters(), settings=settings) == []
+
+
+def test_provider_search_uses_the_site_search_not_searxng(monkeypatch):
+    def _fail(*args, **kwargs):
+        raise AssertionError("SearXNG must not run for a provider search")
+
+    monkeypatch.setitem(
+        providers.SITE_FN,
+        "PornHub",
+        lambda *args, **kwargs: [Video("native", "On site", 30, 1, "https://www.pornhub.com/view_video.php?viewkey=native", "PornHub")],
+    )
+    monkeypatch.setattr(providers, "search_searxng", _fail)
+
+    rows = providers.search_videos(
+        "q", "PornHub", SearchFilters(min_quality="any"), settings=AppSettings(searxng_enabled=True),
+    )
+
+    assert [(row.site, row.id) for row in rows] == [("PornHub", "native")]
+
+
+def test_search_videos_starts_searxng_after_on_site_providers(monkeypatch):
+    release = threading.Event()
+    site_started = threading.Event()
+    searx_started = threading.Event()
+
+    def slow(*args, **kwargs):
+        site_started.set()
+        release.wait(2)
+        return [Video("native", "On site", 30, 1, "https://www.pornhub.com/view_video.php?viewkey=native", "PornHub")]
+
+    def searx(*args, **kwargs):
+        assert site_started.is_set()
+        assert release.is_set()
+        searx_started.set()
+        return [
+            Video("copied", "Copied", 30, 1, "https://www.pornhub.com/view_video.php?viewkey=copied", "PornHub"),
+            Video("web", "Wider web", 30, 1, "https://example.test/web", "SpankBang"),
+        ]
+
+    monkeypatch.setitem(providers.SITE_FN, "PornHub", slow)
+    monkeypatch.setitem(providers.SITE_FN, "xHamster", lambda *args, **kwargs: [])
+    monkeypatch.setitem(providers.SITE_FN, "RedTube", lambda *args, **kwargs: [])
+    monkeypatch.setitem(providers.SITE_FN, "Eporner", lambda *args, **kwargs: [])
+    monkeypatch.setattr(providers, "search_searxng", searx)
+
+    rows_holder: list[list[Video]] = []
+
+    def run():
+        rows_holder.append(providers.search_videos(
+            "q",
+            "All Sites",
+            SearchFilters(min_quality="any"),
+            settings=AppSettings(searxng_enabled=True),
+        ))
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert site_started.wait(2)
+    assert not searx_started.wait(0.05)
+    release.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert searx_started.is_set()
+    assert [(row.site, row.id) for row in rows_holder[0]] == [("PornHub", "native"), ("SpankBang", "web")]
 
 
 def test_pornhub_search_sends_stored_provider_session(monkeypatch, tmp_path):
@@ -782,3 +868,205 @@ def test_pornhub_search_sends_stored_provider_session(monkeypatch, tmp_path):
 
     assert [row.id for row in rows] == ["phHit"]
     assert any("sessid=abc" in header for header in seen_cookies)
+
+
+def test_search_videos_keeps_same_id_from_different_sites(monkeypatch) -> None:
+    def pornhub(*args, **kwargs):
+        return [Video("1", "Alpha", 30, 1, "https://ph.example/1", "PornHub")]
+
+    def eporner(*args, **kwargs):
+        return [Video("1", "Beta", 30, 1, "https://ep.example/1", "Eporner")]
+
+    monkeypatch.setitem(providers.SITE_FN, "PornHub", pornhub)
+    monkeypatch.setitem(providers.SITE_FN, "Eporner", eporner)
+    monkeypatch.setitem(providers.SITE_FN, "xHamster", lambda *args, **kwargs: [])
+    monkeypatch.setitem(providers.SITE_FN, "RedTube", lambda *args, **kwargs: [])
+
+    rows = providers.search_videos("query", "All Sites", SearchFilters(min_quality="any"))
+
+    assert [(row.site, row.id) for row in rows] == [("PornHub", "1"), ("Eporner", "1")]
+
+
+def test_search_videos_reports_a_fast_provider_before_a_slow_one_finishes(monkeypatch) -> None:
+    release = threading.Event()
+    snapshots: list[list[str]] = []
+
+    def slow(*args, **kwargs):
+        release.wait(2)
+        return [Video("slow", "Slow result", 30, 1, "https://ph.example/slow", "PornHub")]
+
+    def fast(*args, **kwargs):
+        return [Video("fast", "Fast result", 30, 1, "https://ep.example/fast", "Eporner")]
+
+    def on_results(videos):
+        ids = [video.id for video in videos]
+        snapshots.append(ids)
+        if "fast" in ids:
+            release.set()
+
+    monkeypatch.setitem(providers.SITE_FN, "PornHub", slow)
+    monkeypatch.setitem(providers.SITE_FN, "Eporner", fast)
+    monkeypatch.setitem(providers.SITE_FN, "xHamster", lambda *args, **kwargs: [])
+    monkeypatch.setitem(providers.SITE_FN, "RedTube", lambda *args, **kwargs: [])
+
+    rows = providers.search_videos(
+        "query", "All Sites", SearchFilters(min_quality="any"), on_results=on_results,
+    )
+
+    assert any("fast" in ids and "slow" not in ids for ids in snapshots)
+    assert [row.id for row in rows] == ["slow", "fast"]
+
+
+def test_search_eporner_stops_before_later_pages_when_cancelled() -> None:
+    requested: list[str] = []
+    cancel = threading.Event()
+
+    class Client:
+        def get(self, url, *args, **kwargs):
+            requested.append(str(url))
+            cancel.set()
+            return _JsonResponse({"videos": [{
+                "id": "p1", "title": "First", "length_sec": 20, "views": 1, "url": "/video-p1/",
+            }]})
+
+    with patch.object(providers, "build_client", return_value=_ClientContext(Client())):
+        rows = providers.search_eporner("query", 0, 9999, 3, cancel_event=cancel)
+
+    assert [row.id for row in rows] == ["p1"]
+    assert len(requested) == 1
+
+
+def test_eporner_keeps_an_earlier_page_error_when_a_later_page_is_empty() -> None:
+    calls = {"n": 0}
+
+    class Client:
+        def get(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("page one down")
+            return _JsonResponse({"videos": []})
+
+    providers.LAST_PROVIDER_ERRORS.clear()
+    with patch.object(providers, "build_client", return_value=_ClientContext(Client())):
+        rows = providers.search_eporner("query", 0, 9999, 2)
+
+    assert rows == []
+    assert calls["n"] == 2
+    assert "page one down" in providers.LAST_PROVIDER_ERRORS["Eporner"]
+
+
+def test_eporner_clears_an_earlier_page_error_when_a_later_page_has_rows() -> None:
+    calls = {"n": 0}
+
+    class Client:
+        def get(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("page one down")
+            return _JsonResponse({"videos": [{
+                "id": "p2", "title": "Second", "length_sec": 20, "views": 1, "url": "/video-p2/",
+            }]})
+
+    providers.LAST_PROVIDER_ERRORS.clear()
+    with patch.object(providers, "build_client", return_value=_ClientContext(Client())):
+        rows = providers.search_eporner("query", 0, 9999, 2)
+
+    assert [row.id for row in rows] == ["p2"]
+    assert "Eporner" not in providers.LAST_PROVIDER_ERRORS
+
+
+def test_search_twitter_stops_waiting_when_cancelled(monkeypatch, tmp_path) -> None:
+    import json
+
+    import selenium.webdriver as webdriver
+
+    cookies = tmp_path / "cookies.json"
+    cookies.write_text(json.dumps({"auth_token": "token-value", "ct0": "csrf"}))
+    cancel = threading.Event()
+    visited: list[str] = []
+
+    class Driver:
+        def get(self, url):
+            visited.append(url)
+            cancel.set()
+
+        def add_cookie(self, cookie):
+            raise AssertionError("cancelled search should stop before setting cookies")
+
+        def execute_script(self, *args):
+            raise AssertionError("cancelled search should not scroll")
+
+        def get_log(self, name):
+            return []
+
+        def quit(self):
+            pass
+
+    monkeypatch.setattr(webdriver, "Chrome", lambda **kwargs: Driver())
+    providers.LAST_PROVIDER_ERRORS.pop("Twitter", None)
+    started = time.monotonic()
+
+    assert providers.search_twitter("cats", 80, cookies, cancel_event=cancel) == []
+
+    assert time.monotonic() - started < 1
+    assert visited == ["https://x.com"]
+    assert "Twitter" not in providers.LAST_PROVIDER_ERRORS
+
+
+def test_search_eporner_on_page_sees_page_one_before_page_two() -> None:
+    requested: list[str] = []
+    seen: list[tuple[int, list[str]]] = []
+
+    class Client:
+        def get(self, url, *args, **kwargs):
+            requested.append(str(url))
+            page = "2" if "&page=2&" in str(url) else "1"
+            return _JsonResponse({"videos": [{
+                "id": f"p{page}", "title": f"Page {page}", "length_sec": 20,
+                "views": 1, "url": f"/video-p{page}/",
+            }]})
+
+    def on_page(rows):
+        seen.append((len(requested), [row.id for row in rows]))
+
+    with patch.object(providers, "build_client", return_value=_ClientContext(Client())):
+        rows = providers.search_eporner("query", 0, 9999, 2, on_page=on_page)
+
+    assert seen[0] == (1, ["p1"])
+    assert [row.id for row in rows] == ["p1", "p2"]
+
+
+def test_pornhub_legacy_api_failure_does_not_repeat_html(monkeypatch) -> None:
+    requested: list[str] = []
+
+    def respond(request):
+        requested.append(request.url.path)
+        return httpx.Response(503, text="Search unavailable")
+
+    monkeypatch.setattr(providers, "LAST_PROVIDER_ERRORS", {})
+    monkeypatch.setattr(
+        providers, "build_client", lambda **kwargs: httpx.Client(transport=httpx.MockTransport(respond)),
+    )
+
+    assert providers.search_pornhub("needle", 0, 9999, 1) == []
+    assert requested.count("/video/search") == 1
+    assert "/webmasters/search" in requested
+
+
+def test_search_videos_keeps_rows_streamed_before_a_provider_fails(monkeypatch) -> None:
+    def flaky(query, min_s, max_s, pages, *, on_page=None, cancel_event=None):
+        row = Video("kept", "Kept result", 30, 1, "https://ph.example/kept", "PornHub")
+        if on_page is not None:
+            on_page([row])
+        raise RuntimeError("broke")
+
+    monkeypatch.setitem(providers.SITE_FN, "PornHub", flaky)
+    monkeypatch.setitem(providers.SITE_FN, "Eporner", lambda *args, **kwargs: [])
+    monkeypatch.setitem(providers.SITE_FN, "xHamster", lambda *args, **kwargs: [])
+    monkeypatch.setitem(providers.SITE_FN, "RedTube", lambda *args, **kwargs: [])
+    providers.LAST_PROVIDER_ERRORS.clear()
+
+    rows = providers.search_videos("query", "All Sites", SearchFilters(min_quality="any"))
+
+    assert [row.id for row in rows] == ["kept"]
+    assert providers.LAST_PROVIDER_ERRORS["PornHub"] == "RuntimeError: broke"

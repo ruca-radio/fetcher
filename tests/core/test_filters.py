@@ -78,6 +78,13 @@ def test_dedupe_videos_drops_duplicate_ids_and_normalized_titles_preserving_orde
     assert dedupe_videos(videos) == [videos[0], videos[3]]
 
 
+def test_dedupe_videos_keeps_the_same_id_from_different_sites() -> None:
+    first = make_video(id="1", site="PornHub", title="Alpha")
+    second = make_video(id="1", site="Eporner", title="Beta")
+
+    assert dedupe_videos([first, second]) == [first, second]
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [

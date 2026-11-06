@@ -8,6 +8,7 @@ Parallel downloads with per-video progress bars
 Temporary downloads are moved into the configured output directory on completion
 """
 
+import inspect
 import json
 import logging
 import math
@@ -38,6 +39,12 @@ from textual.widgets import (
     TabbedContent, TabPane,
 )
 
+from fetcher_core.download_log import (
+    DownloadCatalog,
+    downloads_log_path,
+    video_is_downloaded,
+    without_downloaded,
+)
 from fetcher_core.download import (
     DOWNLOADED_IDS,
     FFMPEG as FFMPEG,  # re-export (public API of fetchtui)
@@ -105,6 +112,16 @@ from fetcher_core.models import (
     SortKey,
     Video,
 )
+def _accepts_keyword(fn, name: str) -> bool:
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
+        return True
+    return name in parameters
+
+
 from fetcher_core.providers import (
     LAST_PROVIDER_ERRORS,
     LAST_PROVIDER_WARNINGS,
@@ -180,20 +197,16 @@ def save_settings(settings: AppSettings) -> None:
 
 def load_downloaded(plex_dir: Path) -> tuple[set[str], set[str]]:
     """Return (video_ids, normalized_titles) of already-downloaded content."""
-    ids: set[str] = set()
-    titles: set[str] = set()
-    if DOWNLOADED_IDS.exists():
-        for line in DOWNLOADED_IDS.read_text().splitlines():
-            line = line.strip()
-            if line:
-                ids.add(line)
-    if plex_dir.exists():
-        for f in plex_dir.iterdir():
-            if f.suffix.lower() in MEDIA_EXTENSIONS:
-                norm = _normalize_title(f.stem)
-                if norm:
-                    titles.add(norm)
-    return ids, titles
+    catalog = DownloadCatalog(downloads_log_path(DOWNLOADED_IDS), DOWNLOADED_IDS, [plex_dir])
+    catalog.reload()
+    return catalog.ids, catalog.titles
+
+
+def result_cell(value: str, downloaded: bool) -> str | Text:
+    """Grey a search cell when the video is already in the download log."""
+    if downloaded:
+        return Text(value, style="#8a8a8a")
+    return value
 
 
 def _render_ascii_thumbnail(image_bytes: bytes, width: int = 34) -> str:
@@ -386,11 +399,13 @@ class HelpScreen(ModalScreen):
                 "[bold cyan]FetchTUI[/]\n\n"
                 "[yellow]Search[/]\n"
                 "  Enter / Search    Run search\n"
+                "  Clear             Clear the query, results, and in-flight search\n"
                 "  Click headers     Sort by name / duration / source / views\n"
                 "  Site dropdown     PornHub · xHamster · RedTube · Eporner · All\n"
                 "  Min/Max/Pages     Duration filter (min) & result depth\n"
                 "  Parallel          Max simultaneous downloads\n"
-                "  Hide downloaded   Skip already-grabbed videos\n\n"
+                "  Hide downloaded   Omit videos already in the download log\n"
+                "                    Uncheck to show those rows in grey\n\n"
                 "[yellow]Selection[/]\n"
                 "  Space / Enter     Toggle row selection\n"
                 "  a                 Select all results\n"
@@ -407,7 +422,8 @@ class HelpScreen(ModalScreen):
                 "  Play file         Open highlighted local file\n\n"
                 "[yellow]Twitter[/]\n"
                 "  Requires login (username + password) — cookies saved locally\n"
-                "  Search returns video tweets only\n\n"
+                "  Search returns video tweets only\n"
+                "  Clear             Clear the Twitter query and results\n\n"
                 "[yellow]Other[/]\n"
                 "  ?   Help    q   Quit (confirms if downloads active)\n",
                 markup=True,
@@ -535,7 +551,7 @@ class FetchTUI(App):
     }
     #site-select  { width: 18; margin: 0 1; }
     #search-input { width: 1fr; margin: 0 1; }
-    #btn-search, #btn-filters { min-width: 10; margin: 0 1; }
+    #btn-search, #btn-filters, #btn-clear { min-width: 10; margin: 0 1; }
 
     #porn-filter-bar {
         height: auto; padding: 0 1;
@@ -601,7 +617,7 @@ class FetchTUI(App):
         background: $panel; layout: horizontal;
     }
     #tw-search-input { width: 1fr; margin: 0 1; }
-    #tw-btn-search   { min-width: 10; margin: 0 1; }
+    #tw-btn-search, #tw-btn-clear { min-width: 10; margin: 0 1; }
     #tw-btn-login    { min-width: 10; margin: 0 1; }
 
     #tw-filter-bar {
@@ -762,13 +778,19 @@ class FetchTUI(App):
         self._download_parallel: int = max(1, self.settings.parallel_downloads)
 
     # Porn tab state
+        self._porn_matches: list[Video] = []
         self._porn_results: list[Video] = []
         self._porn_dl_count: int = 0
         self._porn_sort_key: SortKey = "views"
         self._porn_sort_reverse: bool = True
+        self._porn_search_generation: int = 0
+        self._porn_search_cancel = threading.Event()
 
         # Twitter tab state
+        self._tw_matches: list[Video] = []
         self._tw_results: list[Video] = []
+        self._tw_search_generation: int = 0
+        self._tw_search_cancel = threading.Event()
         self._tw_dl_count: int = 0
         self._tw_logged_in: bool = provider_login.twitter_authenticated()
         self._tw_sort_key: SortKey = "views"
@@ -797,12 +819,13 @@ class FetchTUI(App):
                     yield Input(placeholder="Search (e.g. bbc creampie)…", id="search-input")
                     yield Button("Filters", variant="default", id="btn-filters")
                     yield Button("Search", variant="primary", id="btn-search")
+                    yield Button("Clear", id="btn-clear")
 
                 with Horizontal(id="porn-filter-bar"):
                     yield Label("", id="filter-summary")
                     yield Label("Parallel:")
                     yield Input("3", id="parallel", type="integer")
-                    yield Checkbox("Hide dl'd", value=True, id="hide-dl")
+                    yield Checkbox("Hide downloaded", value=True, id="hide-dl")
                     yield Label("", id="result-count")
 
                 yield DataTable(id="results-table", cursor_type="row", zebra_stripes=True)
@@ -831,13 +854,14 @@ class FetchTUI(App):
                 with Horizontal(id="tw-search-bar"):
                     yield Input(placeholder="Search Twitter (e.g. nsfw video)…", id="tw-search-input")
                     yield Button("Search", variant="primary", id="tw-btn-search")
+                    yield Button("Clear", id="tw-btn-clear")
                     login_label = "✓ Logged in" if self._tw_logged_in else "Login"
                     yield Button(login_label, variant="success" if self._tw_logged_in else "warning", id="tw-btn-login")
 
                 with Horizontal(id="tw-filter-bar"):
                     yield Label("Results:")
                     yield Input("40", id="tw-count", type="integer")
-                    yield Checkbox("Hide dl'd", value=True, id="tw-hide-dl")
+                    yield Checkbox("Hide downloaded", value=True, id="tw-hide-dl")
                     yield Label("", id="tw-result-count")
                     yield Label("", id="tw-login-status")
 
@@ -1270,28 +1294,110 @@ class FetchTUI(App):
     def _video_matches_search_filters(self, video: Video) -> bool:
         return video_matches_filters(video, self.settings.search_filters)
 
-    def _render_porn_results(self) -> None:
+    def _downloaded_row(self, video: Video) -> bool:
+        return video_is_downloaded(video, self._downloaded, self._downloaded_titles)
+
+    def _cursor_video_id(self, table_id: str, results: list[Video]) -> Optional[str]:
+        try:
+            row = self.query_one(table_id, DataTable).cursor_row
+        except Exception:
+            return None
+        if results and 0 <= row < len(results):
+            return results[row].id
+        return None
+
+    def _place_result_cursor(self, table: DataTable, results: list[Video], keep_id: Optional[str], *, active: bool) -> None:
+        if not results:
+            if active:
+                self._set_player_target(None)
+            return
+        index = 0
+        if keep_id:
+            for row, video in enumerate(results):
+                if video.id == keep_id:
+                    index = row
+                    break
+        table.move_cursor(row=index, animate=False)
+        if active:
+            self._set_player_target(results[index])
+
+    def _refresh_porn_display(self, *, keep_cursor: bool = True, status_suffix: str = "") -> None:
+        keep_id = self._cursor_video_id("#results-table", self._porn_results) if keep_cursor else None
+        hide = self.query_one("#hide-dl", Checkbox).value
+        visible = without_downloaded(self._porn_matches, self._downloaded, self._downloaded_titles) if hide else list(self._porn_matches)
+        hidden = len(self._porn_matches) - len(visible)
+        self._porn_results = visible
+        self._render_porn_results(keep_id)
+        label = f"  {len(visible)} results"
+        if hidden:
+            label += f"  ({hidden} downloaded hidden)"
+        if status_suffix:
+            label += f"  {status_suffix}"
+        self.query_one("#result-count", Label).update(label)
+
+    def _refresh_twitter_display(self, *, keep_cursor: bool = True, status_suffix: str = "") -> None:
+        keep_id = self._cursor_video_id("#tw-results-table", self._tw_results) if keep_cursor else None
+        hide = self.query_one("#tw-hide-dl", Checkbox).value
+        visible = without_downloaded(self._tw_matches, self._downloaded, self._downloaded_titles) if hide else list(self._tw_matches)
+        hidden = len(self._tw_matches) - len(visible)
+        self._tw_results = visible
+        self._render_twitter_results(keep_id)
+        label = f"  {len(visible)} results"
+        if hidden:
+            label += f"  ({hidden} downloaded hidden)"
+        if status_suffix:
+            label += f"  {status_suffix}"
+        self.query_one("#tw-result-count", Label).update(label)
+
+    def _refresh_download_marks(self, video: Video) -> None:
+        if video.site == "Twitter":
+            if self._tw_matches:
+                self._refresh_twitter_display()
+            return
+        if self._porn_matches:
+            self._refresh_porn_display()
+
+    @on(Checkbox.Changed, "#hide-dl")
+    def _porn_hide_downloaded_changed(self, _event: Checkbox.Changed) -> None:
+        if self._porn_matches:
+            self._refresh_porn_display()
+
+    @on(Checkbox.Changed, "#tw-hide-dl")
+    def _twitter_hide_downloaded_changed(self, _event: Checkbox.Changed) -> None:
+        if self._tw_matches:
+            self._refresh_twitter_display()
+
+    def _render_porn_results(self, keep_id: Optional[str] = None) -> None:
         self._configure_porn_table()
         table = self.query_one("#results-table", DataTable)
         for i, v in enumerate(self._porn_results):
-            table.add_row("☐" if not v.selected else "☑", v.site, v.title[:62], v.duration_str, v.views_str, key=str(i))
-        if self._porn_results:
-            table.move_cursor(row=0, animate=False)
-            self._set_player_target(self._porn_results[0])
-        else:
-            self._set_player_target(None)
+            downloaded = self._downloaded_row(v)
+            mark = "☑" if v.selected else "☐"
+            table.add_row(
+                result_cell(mark, downloaded),
+                result_cell(v.site, downloaded),
+                result_cell(v.title[:62], downloaded),
+                result_cell(v.duration_str, downloaded),
+                result_cell(v.views_str, downloaded),
+                key=str(i),
+            )
+        self._place_result_cursor(table, self._porn_results, keep_id, active=self._active_tab() == "porn")
 
-    def _render_twitter_results(self) -> None:
+    def _render_twitter_results(self, keep_id: Optional[str] = None) -> None:
         self._configure_twitter_table()
         table = self.query_one("#tw-results-table", DataTable)
         for i, v in enumerate(self._tw_results):
+            downloaded = self._downloaded_row(v)
+            mark = "☑" if v.selected else "☐"
             dur = v.duration_str if v.duration_s > 0 else "—"
-            table.add_row("☐" if not v.selected else "☑", v.title[:72], dur, v.views_str, key=str(i))
-        if self._tw_results:
-            table.move_cursor(row=0, animate=False)
-            self._set_player_target(self._tw_results[0])
-        else:
-            self._set_player_target(None)
+            table.add_row(
+                result_cell(mark, downloaded),
+                result_cell(v.title[:72], downloaded),
+                result_cell(dur, downloaded),
+                result_cell(v.views_str, downloaded),
+                key=str(i),
+            )
+        self._place_result_cursor(table, self._tw_results, keep_id, active=self._active_tab() == "twitter")
 
     def _render_files_table(self) -> None:
         self._configure_files_table()
@@ -1352,77 +1458,116 @@ class FetchTUI(App):
         query = self.query_one("#search-input", Input).value.strip()
         if not query:
             return
+        self._porn_search_cancel.set()
+        self._porn_search_cancel = threading.Event()
+        self._porn_search_generation += 1
+        generation = self._porn_search_generation
         filters = self.settings.search_filters
-        min_s = filters.min_duration_s
-        max_s = filters.max_duration_s
-        pages = filters.pages
-
         site = str(self.query_one("#site-select", Select).value)
+        self._porn_matches = []
+        self._porn_results = []
+        self._refresh_porn_display(keep_cursor=False, status_suffix="searching…")
 
         btn = self.query_one("#btn-search", Button)
         btn.disabled = True
         btn.label = "Searching…"
-        self.query_one("#result-count", Label).update("  searching…")
         self._log(f"Searching [{site}] for '{query}' with {self._filter_summary_text()}…")
-        self._porn_search_worker(query, site, min_s, max_s, pages)
+        self._porn_search_worker(
+            query, site, filters.min_duration_s, filters.max_duration_s, filters.pages,
+            generation, self._porn_search_cancel, filters,
+        )
 
-    @work(thread=True)
-    def _porn_search_worker(self, query: str, site: str, min_s: int, max_s: int, pages: int) -> None:
-        results: list[Video] = []
-        targets = list(SITE_FN.keys()) if site == "All Sites" else [site]
-        for s in targets:
-            if s == "SearXNG":
-                if not self.settings.searxng_enabled:
-                    self.call_from_thread(self._log, "  SearXNG: disabled in settings")
-                    continue
-                found = search_searxng(query, self.settings, pages)
-            else:
-                found = _search_provider(s, query, min_s, max_s, pages)
-            results.extend(found)
-            self.call_from_thread(self._log, f"  {s}: {len(found)} results")
-            if not found and s in LAST_PROVIDER_ERRORS:
-                self.call_from_thread(self._log, f"  {s}: {LAST_PROVIDER_ERRORS[s]}")
-            if s in LAST_PROVIDER_WARNINGS:
-                self.call_from_thread(self._log, f"  {s}: {LAST_PROVIDER_WARNINGS[s]}")
-
-        if site == "All Sites" and self.settings.searxng_enabled:
-            extra = search_searxng(query, self.settings, pages)
-            results.extend(extra)
-            self.call_from_thread(self._log, f"  SearXNG: {len(extra)} results")
-
-        results = [video for video in results if self._video_matches_search_filters(video)]
-        seen_ids: set[str] = set()
-        seen_titles: set[str] = set()
-        unique: list[Video] = []
-        for v in results:
-            norm = _normalize_title(v.title)
-            if v.id in seen_ids:
-                continue
-            if norm and norm in seen_titles:
-                continue
-            seen_ids.add(v.id)
-            if norm:
-                seen_titles.add(norm)
-            unique.append(v)
-        self.call_from_thread(self._porn_populate, unique, site, query)
-
-    def _porn_populate(self, results: list[Video], site: str, query: str) -> None:
+    @on(Button.Pressed, "#btn-clear")
+    def _porn_clear(self) -> None:
+        self._porn_search_cancel.set()
+        self._porn_search_cancel = threading.Event()
+        self._porn_search_generation += 1
+        self.query_one("#search-input", Input).value = ""
+        self._porn_matches = []
+        self._porn_results = []
+        self._refresh_porn_display(keep_cursor=False)
         btn = self.query_one("#btn-search", Button)
         btn.disabled = False
         btn.label = "Search"
 
-        if self.query_one("#hide-dl", Checkbox).value:
-            results = [
-                v for v in results
-                if v.id not in self._downloaded
-                and _normalize_title(v.title) not in self._downloaded_titles
-            ]
+    def _filters_for_bounds(self, min_s: int, max_s: int, pages: int) -> SearchFilters:
+        settings = getattr(self, "settings", None)
+        base = getattr(settings, "search_filters", None) or SearchFilters()
+        unlimited = 24 * 60 * 60
+        max_minutes = 0 if max_s >= unlimited else (max(0, int(max_s)) + 59) // 60
+        return SearchFilters(
+            min_duration_min=max(0, int(min_s)) // 60,
+            max_duration_min=max_minutes,
+            min_quality=base.min_quality,
+            min_rating=base.min_rating,
+            hd_only=base.hd_only,
+            pages=max(1, int(pages)),
+            exclude_phrases=base.exclude_phrases,
+            exclude_censored=base.exclude_censored,
+        )
 
-        self._porn_results = self._sort_results(results, self._porn_sort_key, self._porn_sort_reverse)
-        self._render_porn_results()
+    def _log_provider_diagnostics(self) -> None:
+        for diagnostics in (dict(LAST_PROVIDER_WARNINGS), dict(LAST_PROVIDER_ERRORS)):
+            for site_name, message in sorted(diagnostics.items()):
+                if message:
+                    self.call_from_thread(self._log, f"  {site_name}: {message}")
 
-        self.query_one("#result-count", Label).update(f"  {len(results)} results")
-        self._log(f"[{site}] '{query}' → {len(results)} videos")
+    @work(thread=True)
+    def _porn_search_worker(
+        self,
+        query: str,
+        site: str,
+        min_s: int,
+        max_s: int,
+        pages: int,
+        generation: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        filters: Optional[SearchFilters] = None,
+    ) -> None:
+        if generation is None:
+            generation = getattr(self, "_porn_search_generation", 0)
+        if filters is None:
+            filters = FetchTUI._filters_for_bounds(self, min_s, max_s, pages)
+        results: list[Video] = []
+        try:
+            def on_results(videos: list[Video], token: int = generation) -> None:
+                if token != getattr(self, "_porn_search_generation", token):
+                    return
+                self.call_from_thread(self._porn_show_partial, list(videos), token)
+
+            results = list(search_videos(
+                query,
+                site,
+                filters,
+                twitter_count=40,
+                settings=getattr(self, "settings", None),
+                on_results=on_results,
+                cancel_event=cancel_event,
+            ) or [])
+        except Exception as exc:
+            self.call_from_thread(self._log, f"Search error: {exc}")
+            results = []
+        if generation != getattr(self, "_porn_search_generation", generation):
+            return
+        FetchTUI._log_provider_diagnostics(self)
+        self.call_from_thread(self._porn_populate, results, site, query, generation)
+
+    def _porn_show_partial(self, results: list[Video], generation: int) -> None:
+        if generation != self._porn_search_generation:
+            return
+        self._porn_matches = self._sort_results(results, self._porn_sort_key, self._porn_sort_reverse)
+        self._refresh_porn_display(keep_cursor=True, status_suffix="searching…")
+
+    def _porn_populate(self, results: list[Video], site: str, query: str, generation: Optional[int] = None) -> None:
+        if generation is not None and generation != getattr(self, "_porn_search_generation", generation):
+            return
+        btn = self.query_one("#btn-search", Button)
+        btn.disabled = False
+        btn.label = "Search"
+
+        self._porn_matches = self._sort_results(results, self._porn_sort_key, self._porn_sort_reverse)
+        self._refresh_porn_display(keep_cursor=False)
+        self._log(f"[{site}] '{query}' → {len(self._porn_results)} videos")
 
     # ══════════════════════════════════════════════════════════════════════════
     # TWITTER TAB
@@ -1471,15 +1616,12 @@ class FetchTUI(App):
     def _tw_signin_finished(self, result) -> None:
         self._tw_signin_active = False
         self._tw_signin_cancel = None
-        self._tw_logged_in = provider_login.twitter_authenticated()
+        self._sync_twitter_login_button()
         try:
-            btn = self.query_one("#tw-btn-login", Button)
-            btn.disabled = False
-            btn.label = "✓ Logged in" if self._tw_logged_in else "Login"
-            btn.variant = "success" if self._tw_logged_in else "warning"
             self.query_one("#tw-login-status", Static).update(getattr(result, "message", ""))
         except Exception:
             pass
+        self._refresh_provider_signin_status()
         self._log(getattr(result, "message", "Twitter: sign-in finished."))
 
     @on(Button.Pressed, "#tw-btn-search")
@@ -1505,47 +1647,71 @@ class FetchTUI(App):
         except ValueError:
             count = 40
 
+        self._tw_search_cancel.set()
+        self._tw_search_cancel = threading.Event()
+        self._tw_search_generation += 1
+        generation = self._tw_search_generation
+        self._tw_matches = []
+        self._tw_results = []
+        self._refresh_twitter_display(keep_cursor=False, status_suffix="searching…")
         btn = self.query_one("#tw-btn-search", Button)
         btn.disabled = True
         btn.label = "Searching…"
-        self.query_one("#tw-result-count", Label).update("  searching…")
         self._log(f"Twitter: searching '{query}'…")
-        self._tw_search_worker(query, count)
+        self._tw_search_worker(query, count, generation, self._tw_search_cancel)
+
+    @on(Button.Pressed, "#tw-btn-clear")
+    def _tw_clear(self) -> None:
+        self._tw_search_cancel.set()
+        self._tw_search_cancel = threading.Event()
+        self._tw_search_generation += 1
+        self.query_one("#tw-search-input", Input).value = ""
+        self._tw_matches = []
+        self._tw_results = []
+        self._refresh_twitter_display(keep_cursor=False)
+        btn = self.query_one("#tw-btn-search", Button)
+        btn.disabled = False
+        btn.label = "Search"
 
     @work(thread=True)
-    def _tw_search_worker(self, query: str, count: int) -> None:
+    def _tw_search_worker(
+        self,
+        query: str,
+        count: int,
+        generation: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
+        if generation is None:
+            generation = getattr(self, "_tw_search_generation", 0)
         try:
-            results = search_twitter(query, count, TWITTER_COOKIES)
+            optional = {}
+            if cancel_event is not None and _accepts_keyword(search_twitter, "cancel_event"):
+                optional["cancel_event"] = cancel_event
+            results = search_twitter(query, count, TWITTER_COOKIES, **optional)
         except Exception as e:
             self.call_from_thread(self._log, f"Twitter search error: {e}")
             results = []
 
-        # Dedup
+        if generation != getattr(self, "_tw_search_generation", generation):
+            return
         seen_ids: set[str] = set()
         unique: list[Video] = []
         for v in results:
             if v.id not in seen_ids:
                 seen_ids.add(v.id)
                 unique.append(v)
-        self.call_from_thread(self._tw_populate, unique, query)
+        self.call_from_thread(self._tw_populate, unique, query, generation)
 
-    def _tw_populate(self, results: list[Video], query: str) -> None:
+    def _tw_populate(self, results: list[Video], query: str, generation: Optional[int] = None) -> None:
+        if generation is not None and generation != getattr(self, "_tw_search_generation", generation):
+            return
         btn = self.query_one("#tw-btn-search", Button)
         btn.disabled = False
         btn.label = "Search"
 
-        if self.query_one("#tw-hide-dl", Checkbox).value:
-            results = [
-                v for v in results
-                if v.id not in self._downloaded
-                and _normalize_title(v.title) not in self._downloaded_titles
-            ]
-
-        self._tw_results = self._sort_results(results, self._tw_sort_key, self._tw_sort_reverse)
-        self._render_twitter_results()
-
-        self.query_one("#tw-result-count", Label).update(f"  {len(results)} results")
-        self._log(f"Twitter: '{query}' → {len(results)} video tweets")
+        self._tw_matches = self._sort_results(results, self._tw_sort_key, self._tw_sort_reverse)
+        self._refresh_twitter_display(keep_cursor=False)
+        self._log(f"Twitter: '{query}' → {len(self._tw_results)} video tweets")
 
     # ══════════════════════════════════════════════════════════════════════════
     # SELECTION (tab-aware)
@@ -1605,8 +1771,8 @@ class FetchTUI(App):
                 return
             self._porn_sort_reverse = not self._porn_sort_reverse if self._porn_sort_key == key else False
             self._porn_sort_key = key
-            self._porn_results = self._sort_results(self._porn_results, self._porn_sort_key, self._porn_sort_reverse)
-            self._render_porn_results()
+            self._porn_matches = self._sort_results(self._porn_matches, self._porn_sort_key, self._porn_sort_reverse)
+            self._refresh_porn_display()
         elif table_id == "#tw-results-table":
             mapping = {1: "title", 2: "duration", 3: "views"}
             key = mapping.get(event.column_index)
@@ -1614,8 +1780,8 @@ class FetchTUI(App):
                 return
             self._tw_sort_reverse = not self._tw_sort_reverse if self._tw_sort_key == key else False
             self._tw_sort_key = key
-            self._tw_results = self._sort_results(self._tw_results, self._tw_sort_key, self._tw_sort_reverse)
-            self._render_twitter_results()
+            self._tw_matches = self._sort_results(self._tw_matches, self._tw_sort_key, self._tw_sort_reverse)
+            self._refresh_twitter_display()
         elif table_id == "#files-table":
             mapping: dict[int, FileSortKey] = {0: "name", 1: "size", 2: "modified", 3: "path"}
             key = mapping.get(event.column_index)
@@ -1632,7 +1798,8 @@ class FetchTUI(App):
         v = results[idx]
         v.selected = not v.selected
         self.query_one(table_id, DataTable).update_cell_at(
-            Coordinate(idx, 0), "☑" if v.selected else "☐"
+            Coordinate(idx, 0),
+            result_cell("☑" if v.selected else "☐", self._downloaded_row(v)),
         )
 
     def action_select_all(self) -> None:
@@ -1642,7 +1809,7 @@ class FetchTUI(App):
         t = self.query_one(self._current_table_id(), DataTable)
         for i, v in enumerate(results):
             v.selected = True
-            t.update_cell_at(Coordinate(i, 0), "☑")
+            t.update_cell_at(Coordinate(i, 0), result_cell("☑", self._downloaded_row(v)))
 
     def action_clear_selection(self) -> None:
         if self._active_tab() == "files":
@@ -1651,7 +1818,7 @@ class FetchTUI(App):
         t = self.query_one(self._current_table_id(), DataTable)
         for i, v in enumerate(results):
             v.selected = False
-            t.update_cell_at(Coordinate(i, 0), "☐")
+            t.update_cell_at(Coordinate(i, 0), result_cell("☐", self._downloaded_row(v)))
 
     # ══════════════════════════════════════════════════════════════════════════
     # DOWNLOAD (tab-aware)
@@ -1762,13 +1929,42 @@ class FetchTUI(App):
                 count = provider_login.cookie_count(site)
             except Exception:
                 count = 0
+            legacy = False
+            if site == "Twitter" and count == 0:
+                try:
+                    legacy = bool(provider_login.twitter_authenticated())
+                except Exception:
+                    legacy = False
             try:
                 label = self.query_one(f"#settings-signin-{slug}", Static)
-                label.update(f"Signed in ({count} cookies)" if count else "Not signed in")
+                if count:
+                    label.update(f"Signed in ({count} cookies)")
+                elif legacy:
+                    label.update("Signed in via legacy cookie file")
+                else:
+                    label.update("Not signed in")
                 signout = self.query_one(f"#btn-signout-{slug}", Button)
-                signout.disabled = count == 0
+                signout.disabled = count == 0 and not legacy
             except Exception:
                 continue
+
+    def _sync_twitter_login_button(self) -> None:
+        """Match the Twitter tab's login button to the session stores."""
+        try:
+            self._tw_logged_in = bool(provider_login.twitter_authenticated())
+        except Exception:
+            self._tw_logged_in = False
+        try:
+            button = self.query_one("#tw-btn-login", Button)
+        except Exception:
+            return
+        button.disabled = False
+        if self._tw_logged_in:
+            button.label = "✓ Logged in"
+            button.variant = "success"
+        else:
+            button.label = "Login"
+            button.variant = "warning"
 
     def _provider_signin_buttons(self) -> list[Button]:
         buttons = []
@@ -1817,6 +2013,8 @@ class FetchTUI(App):
         for button in self._provider_signin_buttons():
             button.label = "Sign in"
         self._refresh_provider_signin_status()
+        if getattr(result, "site", None) == "Twitter":
+            self._sync_twitter_login_button()
         self._set_settings_status(result.message)
         self._log(result.message)
 
@@ -1827,6 +2025,8 @@ class FetchTUI(App):
             self._set_settings_status(f"{site}: sign-out failed ({exc}).")
             return
         self._refresh_provider_signin_status()
+        if site == "Twitter":
+            self._sync_twitter_login_button()
         message = f"{site}: session cleared." if cleared else f"{site}: no stored session."
         self._set_settings_status(message)
         self._log(message)
@@ -1973,6 +2173,7 @@ class FetchTUI(App):
                 norm = _normalize_title(finished.video.title)
                 if norm:
                     self._downloaded_titles.add(norm)
+                self.call_from_thread(self._refresh_download_marks, finished.video)
             row = self._all_job_rows.get(finished.video.id)
             if row:
                 self.call_from_thread(row.refresh_display)

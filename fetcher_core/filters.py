@@ -61,16 +61,18 @@ def video_matches_filters(video: Video, filters: SearchFilters) -> bool:
 
 
 def dedupe_videos(videos: list[Video]) -> list[Video]:
-    seen_ids: set[str] = set()
+    seen_ids: set[tuple[str, str]] = set()
     seen_titles: set[str] = set()
     unique: list[Video] = []
     for video in videos:
         norm = normalize_title(video.title)
-        if video.id in seen_ids:
+        # Numeric ids repeat across providers. Identity is the provider plus the id.
+        identity = (video.site, video.id)
+        if identity in seen_ids:
             continue
         if norm and norm in seen_titles:
             continue
-        seen_ids.add(video.id)
+        seen_ids.add(identity)
         if norm:
             seen_titles.add(norm)
         unique.append(video)

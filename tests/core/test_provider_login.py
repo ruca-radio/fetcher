@@ -14,6 +14,7 @@ from fetcher_core import provider_login
 @pytest.fixture(autouse=True)
 def _isolated_legacy_twitter(tmp_path, monkeypatch):
     monkeypatch.setattr(provider_login, "LEGACY_TWITTER_COOKIES", tmp_path / "isolated_twitter_cookies.json")
+    monkeypatch.setattr(provider_login, "LEGACY_TWITTER_NETSCAPE", tmp_path / "isolated_twitter_cookies.net.txt")
 
 
 @pytest.fixture()
@@ -367,3 +368,51 @@ def test_test_session_uses_legacy_twitter_auth_token(monkeypatch, cookies_dir):
 
     assert check.status == "valid"
     assert provider_login.twitter_authenticated() is True
+
+
+def test_test_session_legacy_token_is_not_shadowed_by_anonymous_cookies(monkeypatch, cookies_dir):
+    _store("Twitter", guest_id="anon")
+    provider_login.LEGACY_TWITTER_COOKIES.parent.mkdir(parents=True, exist_ok=True)
+    provider_login.LEGACY_TWITTER_COOKIES.write_text(
+        '{"auth_token": "legacy-token", "ct0": "csrf"}',
+        encoding="utf-8",
+    )
+    seen: list[str] = []
+
+    def handler(request):
+        seen.append(request.headers.get("cookie", ""))
+        return httpx.Response(200, text="home", request=request)
+
+    _mock_http(monkeypatch, handler)
+
+    check = provider_login.test_session("Twitter")
+
+    assert check.status == "valid"
+    assert seen
+    assert "auth_token=legacy-token" in seen[0]
+    assert "guest_id" not in seen[0]
+
+
+def test_aylo_explicit_logged_out_beats_shared_menu_markup(monkeypatch, cookies_dir):
+    _store("PornHub", sessid="abc")
+    page = (
+        '<div id="profileMenuDropdown"></div><i class="ph-icon-logout"></i>'
+        "<script>var isLoggedInUser = 0;</script>"
+    )
+    _mock_http(monkeypatch, lambda request: httpx.Response(200, text=page, request=request))
+
+    check = provider_login.test_session("PornHub")
+
+    assert check.status == "invalid"
+
+
+def test_clear_cookies_forgets_legacy_twitter_session(cookies_dir):
+    provider_login.LEGACY_TWITTER_COOKIES.parent.mkdir(parents=True, exist_ok=True)
+    provider_login.LEGACY_TWITTER_COOKIES.write_text('{"auth_token": "legacy-token"}', encoding="utf-8")
+    provider_login.LEGACY_TWITTER_NETSCAPE.write_text("# netscape\n", encoding="utf-8")
+
+    assert provider_login.twitter_authenticated() is True
+    assert provider_login.clear_cookies("Twitter") is True
+    assert provider_login.twitter_authenticated() is False
+    assert not provider_login.LEGACY_TWITTER_COOKIES.exists()
+    assert not provider_login.LEGACY_TWITTER_NETSCAPE.exists()
